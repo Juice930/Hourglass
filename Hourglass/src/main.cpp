@@ -37,6 +37,10 @@ bool nextGrid[H][W];
 // Track unchanged steps for auto-flip
 uint8_t unchangedSteps = 0;
 const uint8_t UNCHANGED_STEPS_THRESHOLD = 10; // Number of steps before auto-flip
+// New diagonal falling grain animation state
+uint8_t fallingGrainCount = 0; // How many grains have landed in bottom
+const uint8_t MAX_GRAINS = 36; // 1+2+3+...+8
+bool fallingGrainActive = false; // If true, animating a grain
 
 uint32_t lastStep = 0;
 const uint16_t STEP_MS = 500;     // animation speed
@@ -63,6 +67,27 @@ const uint8_t NECK_X = 4;
 uint16_t SAND_COUNT = 16; // Reduced for debugging
 
 // ---------------------- Helpers ----------------------
+
+void render() {
+  // Clear all modules
+  mx.clear();
+
+  // Our logical (0,0) is the top-left of the combined 16x8.
+  // Device 0 = top matrix, device 1 = bottom matrix.
+  // For daisy-chained devices, we calculate the absolute column position
+  for (uint8_t y=0; y<H; y++) {
+    uint8_t dev = (y < 8) ? 0 : 1;
+    uint8_t row = (y < 8) ? y : (y - 8);
+
+    for (uint8_t x=0; x<W; x++) {
+      bool on = grid[y][x];
+      // Calculate absolute column: device 0 uses cols 0-7, device 1 uses cols 8-15
+      uint8_t absCol = dev * 8 + x;
+      mx.setPoint(row, absCol, on);
+    }
+  }
+}
+
 void clearGrid() {
   for (uint8_t y=0; y<H; y++)
     for (uint8_t x=0; x<W; x++)
@@ -170,77 +195,59 @@ void initDiamondMapping() {
   }
 }
 
-// Encapsulated falling animation
-void animateFallingGrain() {
-  // Fill top except for grains that have fallen
-  for (uint8_t i = fallingGrain + (isFalling ? 1 : 0); i < GRAINS; i++) {
-    uint8_t idx = grainOrder[i];
-    uint8_t y = idx / N;
-    uint8_t x = idx % N;
-    grid[y][x] = true;
-  }
-  // Fill bottom with grains that have fallen (bottom up, X mirrored)
-  for (uint8_t i = 0; i < fallingGrain; i++) {
-    uint8_t idx = grainOrder[i];
-    uint8_t y = idx / N;
-    uint8_t x = idx % N;
-    grid[(N-1-y)+N][N-1-x] = true;
-  }
-  // Animate the falling grain
-  if (fallingGrain < GRAINS) {
-    if (!isFalling) {
-      uint8_t idx = grainOrder[fallingGrain];
-      fallY = idx / N;
-      fallX = idx % N;
-      isFalling = true;
-    }
-    // Move grain one step
-    if (fallY < N-1) {
-      // Try to fall diagonally left or right if possible
-      bool leftBlocked = (fallX > 0) ? grid[fallY+1][fallX-1] : true;
-      bool rightBlocked = (fallX < N-1) ? grid[fallY+1][fallX+1] : true;
-      if (!leftBlocked) {
-        fallY++;
-        fallX--;
-      } else if (!rightBlocked) {
-        fallY++;
-        fallX++;
-      } else if (!grid[fallY+1][fallX]) {
-        fallY++;
+// Diagonal falling grain animation for bottom matrix
+void fallingGrainStep() {
+  // Only update the bottom matrix and falling grain
+  // Place landed grains in diagonal pattern (falling down and right)
+  uint8_t grainNum = 0;
+  for (uint8_t diag = 0; diag < 8; diag++) {
+    for (uint8_t i = 0; i <= diag; i++) {
+      if (grainNum < fallingGrainCount) {
+        uint8_t y = 8 + i;
+        uint8_t x = diag - i;
+        grid[y][x] = true;
+        grainNum++;
       }
     }
-    // Show grain at its current position
-    if (fallY < N) {
-      grid[fallY][fallX] = true;
-    } else {
-      // In bottom matrix, mirror X
-      grid[(fallY-N)+N][N-1-fallX] = true;
-    }
-    // If landed (next position is blocked or at bottom), finish falling
-    bool landed = false;
-    if (fallY == N-1) landed = true;
-    else if ((fallY < N-1) && (grid[fallY+1][fallX] || (fallX > 0 && grid[fallY+1][fallX-1]) || (fallX < N-1 && grid[fallY+1][fallX+1]))) landed = true;
-    if (landed) {
-      isFalling = false;
-      fallingGrain++;
-      fallY = -1; fallX = -1;
-    }
-  } else {
-    // Reset after a pause
-    static uint8_t pause2 = 0;
-    pause2++;
-    if (pause2 > 20) {
-      fallingGrain = 0;
-      topFilled = true;
-      pause2 = 0;
-    }
-    isFalling = false;
-    fallY = -1; fallX = -1;
   }
+
+  // Animate the falling grain, erase previous
+  if (fallingGrainCount < MAX_GRAINS && fallingGrainActive) {
+    // Find current grain position
+    grainNum = 0;
+    uint8_t diag = 0, i = 0;
+    for (diag = 0; diag < 8; diag++) {
+      for (i = 0; i <= diag; i++) {
+        if (grainNum == fallingGrainCount) break;
+        grainNum++;
+      }
+      if (grainNum == fallingGrainCount) break;
+    }
+    uint8_t y = 8 + i;
+    uint8_t x = diag - i;
+    // Erase previous grain (if not first)
+    if (fallingGrainCount > 0) {
+      grainNum = 0;
+      uint8_t prevDiag = 0, prevI = 0;
+      for (prevDiag = 0; prevDiag < 8; prevDiag++) {
+        for (prevI = 0; prevI <= prevDiag; prevI++) {
+          if (grainNum == fallingGrainCount - 1) break;
+          grainNum++;
+        }
+        if (grainNum == fallingGrainCount - 1) break;
+      }
+      uint8_t prevY = 8 + prevI;
+      uint8_t prevX = prevDiag - prevI;
+      grid[prevY][prevX] = false;
+    }
+    // Show current falling grain
+    grid[y][x] = true;
+  }
+  render();
 }
 
 void stepSand() {
-  clearGrid();
+  //clearGrid();
   if (topFilled) {
     // Fill the top 8x8 matrix
     for (uint8_t y = 0; y < N; y++) {
@@ -254,64 +261,37 @@ void stepSand() {
     if (pause > 10) {
       topFilled = false;
       pause = 0;
+      fallingGrainCount = 0;
+      fallingGrainActive = true;
     }
     isFalling = false;
     fallY = -1; fallX = -1;
   } else {
-    animateFallingGrain();
+    fallingGrainStep();
   }
-}
-
-void render() {
-  // Clear all modules
-  mx.clear();
-
-  // Our logical (0,0) is the top-left of the combined 16x8.
-  // Device 0 = top matrix, device 1 = bottom matrix.
-  // For daisy-chained devices, we calculate the absolute column position
-  for (uint8_t y=0; y<H; y++) {
-    uint8_t dev = (y < 8) ? 0 : 1;
-    uint8_t row = (y < 8) ? y : (y - 8);
-
-    for (uint8_t x=0; x<W; x++) {
-      bool on = grid[y][x];
-      // Calculate absolute column: device 0 uses cols 0-7, device 1 uses cols 8-15
-      uint8_t absCol = dev * 8 + x;
-      mx.setPoint(row, absCol, on);
-    }
-  }
-
-  // ...existing code...
-}
-
-// Encapsulated falling animation update
-void updateFallingAnimation() {
-  clearGrid();
-  animateFallingGrain();
-  render();
 }
 
 void updateSandLogic() {
   stepSand();
-  render();
   printGridDebug();
-  if (isGridUnchanged()) {
-    unchangedSteps++;
-  } else {
-    unchangedSteps = 0;
-  }
-  // Only flip if grid is unchanged for several steps and all sand is in bottom/top
-  uint16_t sandInBottom = 0;
-  uint8_t yStart = (gravityDir == +1) ? 8 : 0;
-  uint8_t yEnd   = (gravityDir == +1) ? 16 : 8;
-  for (uint8_t y = yStart; y < yEnd; y++) {
-    for (uint8_t x = 0; x < W; x++) {
-      if (grid[y][x]) sandInBottom++;
+  if (fallingGrainActive) {
+    // After each falling grain lands, increment count and deactivate
+    fallingGrainActive = false;
+    fallingGrainCount++;
+    if (fallingGrainCount < MAX_GRAINS) {
+      // Prepare next grain
+      fallingGrainActive = true;
     }
   }
-  if (sandInBottom == SAND_COUNT && unchangedSteps >= UNCHANGED_STEPS_THRESHOLD) {
-    gravityDir = -gravityDir;
-    seedSandBottom();
+  // Only flip if all grains have landed and unchanged for several steps
+  if (fallingGrainCount == MAX_GRAINS) {
+    unchangedSteps++;
+    if (unchangedSteps >= UNCHANGED_STEPS_THRESHOLD) {
+      gravityDir = -gravityDir;
+      topFilled = true;
+      unchangedSteps = 0;
+    }
+  } else {
     unchangedSteps = 0;
   }
 }
@@ -374,6 +354,5 @@ void loop() {
   // Update falling animation at a faster rate
   if (isFalling && now - lastFallStep >= FALL_STEP_MS) {
     lastFallStep = now;
-    updateFallingAnimation();
   }
 }
