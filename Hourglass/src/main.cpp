@@ -179,15 +179,16 @@ void printGridDebug() {
   Serial.println(" m/s²");
   */
   
-  // Print system state info (tilt info is now in checkTilt())
-  Serial.print("State: ");
+  // Print system state info (overwrite same line)
+  Serial.print(" | State: ");
   switch(currentState) {
     case STANDBY: Serial.print("STANDBY"); break;
     case COUNTDOWN: Serial.print("COUNTDOWN"); break;
     case COMPLETED: Serial.print("COMPLETED"); break;
   }
   Serial.print(" | Sand: ");
-  Serial.println(fallingGrain);
+  Serial.print(fallingGrain);
+  Serial.print("    "); // Add spaces to clear any remaining characters
 }
 
 // Encapsulated unchanged grid check
@@ -279,36 +280,84 @@ void resetSystem() {
 // Encapsulated falling/transfer draw (does not advance counts)
 static void drawSandState() {
   clearGrid();
+  
+  // Check if hourglass is upside down
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  bool isUpsideDown = (a.acceleration.z < -2.0);
+  
   if (topFilled) {
-    // Fill the top 8x8 matrix
-    for (uint8_t y = 0; y < N; y++) {
-      for (uint8_t x = 0; x < N; x++) {
-        grid[y][x] = true;
+    if (isUpsideDown) {
+      // Upside down: fill the bottom 8x8 matrix
+      for (uint8_t y = 8; y < 16; y++) {
+        for (uint8_t x = 0; x < W; x++) {
+          grid[y][x] = true;
+        }
+      }
+    } else {
+      // Right side up: fill the top 8x8 matrix
+      for (uint8_t y = 0; y < N; y++) {
+        for (uint8_t x = 0; x < N; x++) {
+          grid[y][x] = true;
+        }
       }
     }
   } else {
-    // Fill top except for grains that have fallen
-    for (uint8_t i = fallingGrain; i < GRAINS; i++) {
-      uint8_t idx = grainOrder[i];
-      uint8_t y = idx / N;
-      uint8_t x = idx % N;
-      grid[y][x] = true;
-    }
-    // Fill bottom with grains that have fallen (bottom up, X mirrored)
-    for (uint8_t i = 0; i < fallingGrain; i++) {
-      uint8_t idx = grainOrder[i];
-      uint8_t y = idx / N;
-      uint8_t x = idx % N;
-      grid[(N-1-y)+N][N-1-x] = true;
+    if (isUpsideDown) {
+      // Upside down: sand flows from bottom to top with 180° rotation
+      // Fill bottom except for grains that have fallen
+      for (uint8_t i = fallingGrain; i < GRAINS; i++) {
+        uint8_t idx = grainOrder[i];
+        uint8_t y = (N-1-idx/N) + 8; // Mirror Y in bottom matrix
+        uint8_t x = (N-1-idx%N);      // Mirror X for 180° rotation
+        grid[y][x] = true;
+      }
+      // Fill top with grains that have fallen (top down, X mirrored for 180° rotation)
+      for (uint8_t i = 0; i < fallingGrain; i++) {
+        uint8_t idx = grainOrder[i];
+        uint8_t y = (N-1-idx/N);
+        uint8_t x = (N-1-idx%N);      // Mirror X for 180° rotation
+        grid[y][x] = true;
+      }
+    } else {
+      // Right side up: sand flows from top to bottom (original behavior)
+      // Fill top except for grains that have fallen
+      for (uint8_t i = fallingGrain; i < GRAINS; i++) {
+        uint8_t idx = grainOrder[i];
+        uint8_t y = idx / N;
+        uint8_t x = idx % N;
+        grid[y][x] = true;
+      }
+      // Fill bottom with grains that have fallen (bottom up, X mirrored)
+      for (uint8_t i = 0; i < fallingGrain; i++) {
+        uint8_t idx = grainOrder[i];
+        uint8_t y = idx / N;
+        uint8_t x = idx % N;
+        grid[(N-1-y)+N][N-1-x] = true;
+      }
     }
   }
 }
 
-// Overlay the single falling grain on the bottom diagonal
+// Overlay the single falling grain on the appropriate diagonal
 static void drawBottomFallingGrain() {
-  // Show falling grain in the bottom matrix
-  uint8_t y = 8 + bottomFallPhase;
-  uint8_t x = bottomFallPhase;
+  // Check if hourglass is upside down
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  bool isUpsideDown = (a.acceleration.z < -2.0);
+  
+  uint8_t y, x;
+  
+  if (isUpsideDown) {
+    // Upside down: falling grain in top matrix, moving from top-left to bottom-right
+    y = bottomFallPhase;
+    x = bottomFallPhase;
+  } else {
+    // Right side up: falling grain in bottom matrix, moving from top-left to bottom-right
+    y = 8 + bottomFallPhase;
+    x = bottomFallPhase;
+  }
+  
   grid[y][x] = true;
 }
 
@@ -386,12 +435,17 @@ void checkTilt() {
     tiltAngle = acos(abs(zAccel) / magnitude) * 180.0 / PI;
   }
   
-  // Debug: print tilt angle
-  Serial.print("Tilt: ");
+  // Detect if hourglass is flipped (upside down)
+  // When Z is negative, it's upside down
+  bool isUpsideDown = (zAccel < -2.0); // Threshold to avoid false triggers
+  
+  // Debug: print tilt angle (overwrite same line)
+  Serial.print("\rTilt: ");
   Serial.print(tiltAngle, 1);
   Serial.print("° | Z: ");
   Serial.print(zAccel, 2);
-  Serial.print(" m/s²");
+  Serial.print(" m/s² | Upside down: ");
+  Serial.print(isUpsideDown ? "YES" : "NO");
   
   // Consider stable if tilt is close to 0° (flat) or 180° (upside down)
   bool isStable = (tiltAngle < 15.0) || (tiltAngle > 165.0);
@@ -402,7 +456,7 @@ void checkTilt() {
       Serial.println(" | TILT DETECTED - Starting countdown!");
       resetSystem();
     } else {
-      Serial.println(" | Stable position");
+      Serial.print(" | Stable position");
     }
   } else if (currentState == COMPLETED) {
     // Restart when tilted away from stable positions
@@ -410,10 +464,10 @@ void checkTilt() {
       Serial.println(" | TILT DETECTED - Restarting countdown!");
       resetSystem();
     } else {
-      Serial.println(" | Stable position");
+      Serial.print(" | Stable position");
     }
   } else {
-    Serial.println(" | Countdown active");
+    Serial.print(" | Countdown active");
   }
 }
 
