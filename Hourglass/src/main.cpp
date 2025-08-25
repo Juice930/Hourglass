@@ -312,11 +312,11 @@ static void drawSandState() {
         uint8_t x = (N-1-idx%N);      // Mirror X for 180° rotation
         grid[y][x] = true;
       }
-      // Fill top with grains that have fallen (top down, X mirrored for 180° rotation)
+      // Fill top with grains that have fallen (top down, X and Y not mirrored)
       for (uint8_t i = 0; i < fallingGrain; i++) {
         uint8_t idx = grainOrder[i];
-        uint8_t y = (N-1-idx/N);
-        uint8_t x = (N-1-idx%N);      // Mirror X for 180° rotation
+        uint8_t y = idx / N;       // Keep Y as-is (no mirror)
+        uint8_t x = idx % N;       // Keep X as-is (no mirror)
         grid[y][x] = true;
       }
     } else {
@@ -349,9 +349,9 @@ static void drawBottomFallingGrain() {
   uint8_t y, x;
   
   if (isUpsideDown) {
-    // Upside down: falling grain in top matrix, moving from top-left to bottom-right
-    y = bottomFallPhase;
-    x = bottomFallPhase;
+    // Upside down: falling grain in top matrix, moving from bottom-right to top-left
+    y = 7 - bottomFallPhase;
+    x = 7 - bottomFallPhase;
   } else {
     // Right side up: falling grain in bottom matrix, moving from top-left to bottom-right
     y = 8 + bottomFallPhase;
