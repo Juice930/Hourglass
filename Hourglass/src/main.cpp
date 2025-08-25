@@ -21,14 +21,46 @@ const uint8_t PIN_CS = 5;
 const uint16_t NUM_DEVICES = 2;  // 2 x 8x8
 MD_MAX72XX mx(HARDWARE_TYPE, PIN_CS, NUM_DEVICES);
 
+// -------- Buzzer (ESP32 LEDC) --------
+const int BUZZER_PIN = 4;       // Change if needed
+const int BUZZER_CHANNEL = 0;    // LEDC channel 0..15
+const int BUZZER_RESOLUTION = 8; // 8-bit resolution
+bool melodyPlayed = false;
+
+static void buzzerTone(unsigned int freq, unsigned int durationMs) {
+  if (freq == 0) {
+    ledcWrite(BUZZER_CHANNEL, 0);
+    delay(durationMs);
+    return;
+  }
+  ledcWriteTone(BUZZER_CHANNEL, freq);
+  ledcWrite(BUZZER_CHANNEL, 128); // ~50% duty
+  delay(durationMs);
+}
+
+static void playCompletionMelody() {
+  // Simple pleasant chime sequence (not copyrighted melody)
+  const unsigned int notes[] = { 988, 0, 988, 1319, 0, 1175, 988, 0, 784, 988, 0 };
+  const unsigned int lens[]  = { 150, 50, 150, 250, 50, 200, 200, 50, 200, 400, 50 };
+  const size_t count = sizeof(notes)/sizeof(notes[0]);
+  for (size_t i = 0; i < count; i++) {
+    buzzerTone(notes[i], lens[i]);
+  }
+  ledcWrite(BUZZER_CHANNEL, 0);
+}
+
 // -------- MPU6050 --------
-// Adafruit_MPU6050 mpu; // Commented out for now
+Adafruit_MPU6050 mpu;
+
+// -------- System States --------
+enum SystemState {
+  STANDBY,      // Waiting for tilt to start
+  COUNTDOWN,    // Sand is flowing
+  COMPLETED     // Song finished, waiting for tilt to restart
+};
+SystemState currentState = STANDBY;
 
 // -------- Simulation grid --------
-// Falling animation state
-int fallY = -1, fallX = -1; // Current position of falling grain
-bool isFalling = false; // If true, animating a grain falling
-const uint16_t FALL_STEP_MS = 100; // Speed of falling animation
 // 16 rows (two 8x8), 8 columns
 const uint8_t H = 16;
 const uint8_t W = 8;
@@ -39,7 +71,7 @@ uint8_t unchangedSteps = 0;
 const uint8_t UNCHANGED_STEPS_THRESHOLD = 10; // Number of steps before auto-flip
 
 uint32_t lastStep = 0;
-const uint16_t STEP_MS = 500;     // animation speed
+const uint16_t STEP_MS = 500;     // animation speed (grid debug/unused timing)
 
 // Orientation: +1 = gravity to increasing row index (top->bottom)
 //              -1 = gravity upwards (bottom->top)
@@ -62,7 +94,39 @@ const uint8_t NECK_X = 4;
 // Amount of sand (0..H*W). Start with the "bottom" half full-ish:
 uint16_t SAND_COUNT = 16; // Reduced for debugging
 
+// ---------------------- Calibration ----------------------
+// With current behavior: first bottom touch starts transfer (no increment),
+// then 64 increments occur. Each increment happens every 8 fall steps.
+// Total fall steps = 8 * (64 + 1) = 520.
+#define TARGET_DURATION_MS 15000
+#define TOTAL_FALL_STEPS 520
+const uint16_t FALL_STEP_MS = (TARGET_DURATION_MS + (TOTAL_FALL_STEPS/2)) / TOTAL_FALL_STEPS; // rounded
+
+// Independent bottom falling-grain animation
+uint8_t bottomFallPhase = 0;       // 0..7 along the bottom diagonal
+
 // ---------------------- Helpers ----------------------
+
+void render() {
+  // Clear all modules
+  mx.clear();
+
+  // Our logical (0,0) is the top-left of the combined 16x8.
+  // Device 0 = top matrix, device 1 = bottom matrix.
+  // For daisy-chained devices, we calculate the absolute column position
+  for (uint8_t y=0; y<H; y++) {
+    uint8_t dev = (y < 8) ? 0 : 1;
+    uint8_t row = (y < 8) ? y : (y - 8);
+
+    for (uint8_t x=0; x<W; x++) {
+      bool on = grid[y][x];
+      // Calculate absolute column: device 0 uses cols 0-7, device 1 uses cols 8-15
+      uint8_t absCol = dev * 8 + x;
+      mx.setPoint(row, absCol, on);
+    }
+  }
+}
+
 void clearGrid() {
   for (uint8_t y=0; y<H; y++)
     for (uint8_t x=0; x<W; x++)
@@ -72,28 +136,58 @@ void clearGrid() {
 const uint8_t N = 8; // 8x8 matrix
 const uint8_t GRAINS = 64;
 uint8_t grainOrder[GRAINS]; // Diagonal order
-uint8_t fallingGrain = 0; // Current grain to animate
+uint8_t fallingGrain = 0; // Current grain count transferred
 bool topFilled = true; // If true, top is filled, grains are falling
 
 // Encapsulated debug print
 void printGridDebug() {
-  uint16_t sandInBottom = 0;
-  uint8_t yStart = (gravityDir == +1) ? 8 : 0;
-  uint8_t yEnd   = (gravityDir == +1) ? 16 : 8;
-  for (uint8_t y = yStart; y < yEnd; y++) {
-    for (uint8_t x = 0; x < W; x++) {
-      if (grid[y][x]) sandInBottom++;
-    }
+  // Grid debug commented out
+  /*
+  // Serial debug for grid and sand count commented out
+  // uint16_t sandInBottom = 0;
+  // uint8_t yStart = (gravityDir == +1) ? 8 : 0;
+  // uint8_t yEnd   = (gravityDir == +1) ? 16 : 8;
+  // for (uint8_t y = yStart; y < yEnd; y++) {
+  //   for (uint8_t x = 0; x < W; x++) {
+  //     if (grid[y][x]) sandInBottom++;
+  //   }
+  // }
+  // Serial.print("Sand in bottom/top: ");
+  // Serial.println(sandInBottom);
+  // Serial.println("Grid:");
+  // for (uint8_t y = 0; y < H; y++) {
+  //   for (uint8_t x = 0; x < W; x++) {
+  //     Serial.print(grid[y][x] ? "#" : ".");
+  //   }
+  //   Serial.println();
+  // }
+  // Print detected tilt instead
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float xAccel = a.acceleration.x;
+  float yAccel = a.acceleration.y;
+  float zAccel = a.acceleration.z;
+  float magnitude = sqrt(xAccel*xAccel + yAccel*yAccel + zAccel*zAccel);
+  float tiltAngle = 0;
+  if (magnitude > 0.1) {
+    tiltAngle = acos(abs(zAccel) / magnitude) * 180.0 / PI;
   }
-  Serial.print("Sand in bottom/top: ");
-  Serial.println(sandInBottom);
-  Serial.println("Grid:");
-  for (uint8_t y = 0; y < H; y++) {
-    for (uint8_t x = 0; x < W; x++) {
-      Serial.print(grid[y][x] ? "#" : ".");
-    }
-    Serial.println();
+  Serial.print("Tilt: ");
+  Serial.print(tiltAngle, 1);
+  Serial.print("° | Z: ");
+  Serial.print(zAccel, 2);
+  Serial.println(" m/s²");
+  */
+  
+  // Print system state info (tilt info is now in checkTilt())
+  Serial.print("State: ");
+  switch(currentState) {
+    case STANDBY: Serial.print("STANDBY"); break;
+    case COUNTDOWN: Serial.print("COUNTDOWN"); break;
+    case COMPLETED: Serial.print("COMPLETED"); break;
   }
+  Serial.print(" | Sand: ");
+  Serial.println(fallingGrain);
 }
 
 // Encapsulated unchanged grid check
@@ -170,76 +264,20 @@ void initDiamondMapping() {
   }
 }
 
-// Encapsulated falling animation
-void animateFallingGrain() {
-  // Fill top except for grains that have fallen
-  for (uint8_t i = fallingGrain + (isFalling ? 1 : 0); i < GRAINS; i++) {
-    uint8_t idx = grainOrder[i];
-    uint8_t y = idx / N;
-    uint8_t x = idx % N;
-    grid[y][x] = true;
-  }
-  // Fill bottom with grains that have fallen (bottom up, X mirrored)
-  for (uint8_t i = 0; i < fallingGrain; i++) {
-    uint8_t idx = grainOrder[i];
-    uint8_t y = idx / N;
-    uint8_t x = idx % N;
-    grid[(N-1-y)+N][N-1-x] = true;
-  }
-  // Animate the falling grain
-  if (fallingGrain < GRAINS) {
-    if (!isFalling) {
-      uint8_t idx = grainOrder[fallingGrain];
-      fallY = idx / N;
-      fallX = idx % N;
-      isFalling = true;
-    }
-    // Move grain one step
-    if (fallY < N-1) {
-      // Try to fall diagonally left or right if possible
-      bool leftBlocked = (fallX > 0) ? grid[fallY+1][fallX-1] : true;
-      bool rightBlocked = (fallX < N-1) ? grid[fallY+1][fallX+1] : true;
-      if (!leftBlocked) {
-        fallY++;
-        fallX--;
-      } else if (!rightBlocked) {
-        fallY++;
-        fallX++;
-      } else if (!grid[fallY+1][fallX]) {
-        fallY++;
-      }
-    }
-    // Show grain at its current position
-    if (fallY < N) {
-      grid[fallY][fallX] = true;
-    } else {
-      // In bottom matrix, mirror X
-      grid[(fallY-N)+N][N-1-fallX] = true;
-    }
-    // If landed (next position is blocked or at bottom), finish falling
-    bool landed = false;
-    if (fallY == N-1) landed = true;
-    else if ((fallY < N-1) && (grid[fallY+1][fallX] || (fallX > 0 && grid[fallY+1][fallX-1]) || (fallX < N-1 && grid[fallY+1][fallX+1]))) landed = true;
-    if (landed) {
-      isFalling = false;
-      fallingGrain++;
-      fallY = -1; fallX = -1;
-    }
-  } else {
-    // Reset after a pause
-    static uint8_t pause2 = 0;
-    pause2++;
-    if (pause2 > 20) {
-      fallingGrain = 0;
-      topFilled = true;
-      pause2 = 0;
-    }
-    isFalling = false;
-    fallY = -1; fallX = -1;
-  }
+// Reset system to start state
+void resetSystem() {
+  currentState = COUNTDOWN;
+  topFilled = true;
+  fallingGrain = 0;
+  bottomFallPhase = 0;
+  unchangedSteps = 0;
+  melodyPlayed = false;
+  clearGrid();
+  Serial.println("System reset - countdown started!");
 }
 
-void stepSand() {
+// Encapsulated falling/transfer draw (does not advance counts)
+static void drawSandState() {
   clearGrid();
   if (topFilled) {
     // Fill the top 8x8 matrix
@@ -248,59 +286,71 @@ void stepSand() {
         grid[y][x] = true;
       }
     }
-    // Start falling animation after a short pause
-    static uint8_t pause = 0;
-    pause++;
-    if (pause > 10) {
-      topFilled = false;
-      pause = 0;
-    }
-    isFalling = false;
-    fallY = -1; fallX = -1;
   } else {
-    animateFallingGrain();
-  }
-}
-
-void render() {
-  // Clear all modules
-  mx.clear();
-
-  // Our logical (0,0) is the top-left of the combined 16x8.
-  // Device 0 = top matrix, device 1 = bottom matrix.
-  // For daisy-chained devices, we calculate the absolute column position
-  for (uint8_t y=0; y<H; y++) {
-    uint8_t dev = (y < 8) ? 0 : 1;
-    uint8_t row = (y < 8) ? y : (y - 8);
-
-    for (uint8_t x=0; x<W; x++) {
-      bool on = grid[y][x];
-      // Calculate absolute column: device 0 uses cols 0-7, device 1 uses cols 8-15
-      uint8_t absCol = dev * 8 + x;
-      mx.setPoint(row, absCol, on);
+    // Fill top except for grains that have fallen
+    for (uint8_t i = fallingGrain; i < GRAINS; i++) {
+      uint8_t idx = grainOrder[i];
+      uint8_t y = idx / N;
+      uint8_t x = idx % N;
+      grid[y][x] = true;
+    }
+    // Fill bottom with grains that have fallen (bottom up, X mirrored)
+    for (uint8_t i = 0; i < fallingGrain; i++) {
+      uint8_t idx = grainOrder[i];
+      uint8_t y = idx / N;
+      uint8_t x = idx % N;
+      grid[(N-1-y)+N][N-1-x] = true;
     }
   }
-
-  // ...existing code...
 }
 
-// Encapsulated falling animation update
-void updateFallingAnimation() {
-  clearGrid();
-  animateFallingGrain();
-  render();
+// Overlay the single falling grain on the bottom diagonal
+static void drawBottomFallingGrain() {
+  // Show falling grain in the bottom matrix
+  uint8_t y = 8 + bottomFallPhase;
+  uint8_t x = bottomFallPhase;
+  grid[y][x] = true;
+}
+
+// Advance the bottom falling grain animation; return true if it just touched ground
+static bool advanceBottomFallingGrain() {
+  bool touchedGround = (bottomFallPhase == 7);
+  bottomFallPhase = (bottomFallPhase + 1) % 8;
+  return touchedGround;
+}
+
+// Perform one sand transfer step (advance one grain from top to bottom)
+static void performSandStep() {
+  if (topFilled) {
+    // Start transfer on first ground touch
+    topFilled = false;
+    fallingGrain = 0;
+  } else if (fallingGrain < GRAINS) {
+    fallingGrain++;
+  }
+}
+
+void stepSand() {
+  // No pause: transfer only advances when falling grain touches ground
+  // This function only draws current state; stepping is handled externally
+  drawSandState();
 }
 
 void updateSandLogic() {
+  // Draw sand state
   stepSand();
+  // Overlay independent falling grain
+  drawBottomFallingGrain();
+  // Render frame
   render();
   printGridDebug();
+
+  // Auto-flip logic when bottom is full and stable
   if (isGridUnchanged()) {
     unchangedSteps++;
   } else {
     unchangedSteps = 0;
   }
-  // Only flip if grid is unchanged for several steps and all sand is in bottom/top
   uint16_t sandInBottom = 0;
   uint8_t yStart = (gravityDir == +1) ? 8 : 0;
   uint8_t yEnd   = (gravityDir == +1) ? 16 : 8;
@@ -316,22 +366,56 @@ void updateSandLogic() {
   }
 }
 
+// Check accelerometer for tilt detection
+void checkTilt() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
 
-// void maybeFlipFromIMU() {
-//   sensors_event_t a, g, temp;
-//   mpu.getEvent(&a, &g, &temp);
-//
-//   // Use gravity vector sign on Z (or Y) to decide orientation.
-//   // When z changes sign decisively, we flip.
-//   // Threshold ~ +/-6 m/s^2 to avoid tiny shakes.
-//   int newDir = (a.acceleration.z < -6.0) ? +1 : (a.acceleration.z > 6.0 ? -1 : gravityDir);
-//
-//   if (newDir != gravityDir && (millis() - lastFlipMs) > FLIP_DEBOUNCE_MS) {
-//     gravityDir = newDir;
-//     lastFlipMs = millis();
-//     seedSandBottom();  // reset sand to the "new bottom"
-//   }
-// }
+  // Calculate tilt angle from accelerometer data
+  // Tilt angle = arccos(|Z| / sqrt(X² + Y² + Z²))
+  float xAccel = a.acceleration.x;
+  float yAccel = a.acceleration.y;
+  float zAccel = a.acceleration.z;
+  
+  // Calculate magnitude of acceleration vector
+  float magnitude = sqrt(xAccel*xAccel + yAccel*yAccel + zAccel*zAccel);
+  
+  // Calculate tilt angle (0° = flat, 90° = vertical)
+  float tiltAngle = 0;
+  if (magnitude > 0.1) { // Avoid division by zero
+    tiltAngle = acos(abs(zAccel) / magnitude) * 180.0 / PI;
+  }
+  
+  // Debug: print tilt angle
+  Serial.print("Tilt: ");
+  Serial.print(tiltAngle, 1);
+  Serial.print("° | Z: ");
+  Serial.print(zAccel, 2);
+  Serial.print(" m/s²");
+  
+  // Consider stable if tilt is close to 0° (flat) or 180° (upside down)
+  bool isStable = (tiltAngle < 15.0) || (tiltAngle > 165.0);
+  
+  if (currentState == STANDBY) {
+    // Start countdown when tilted away from stable positions
+    if (!isStable) {
+      Serial.println(" | TILT DETECTED - Starting countdown!");
+      resetSystem();
+    } else {
+      Serial.println(" | Stable position");
+    }
+  } else if (currentState == COMPLETED) {
+    // Restart when tilted away from stable positions
+    if (!isStable) {
+      Serial.println(" | TILT DETECTED - Restarting countdown!");
+      resetSystem();
+    } else {
+      Serial.println(" | Stable position");
+    }
+  } else {
+    Serial.println(" | Countdown active");
+  }
+}
 
 // ---------------------- Setup & Loop ----------------------
 void setup() {
@@ -343,15 +427,22 @@ void setup() {
   mx.control(MD_MAX72XX::INTENSITY, 6); // 0..15
   mx.clear();
 
+  // Buzzer
+  ledcSetup(BUZZER_CHANNEL, 1000, BUZZER_RESOLUTION);
+  ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
+  ledcWrite(BUZZER_CHANNEL, 0);
+
   // MPU6050
-  // if (!mpu.begin()) {
-  //   // If no sensor, still run animation (gravity won't flip)
-  //   Serial.println("MPU6050 not found! Running without flip.");
-  // } else {
-  //   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  //   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  //   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  // }
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found! Running without tilt detection.");
+    // If no sensor, start countdown immediately
+    resetSystem();
+  } else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("MPU6050 initialized. Tilt to start countdown.");
+  }
 
   // Start with gravity "down" (+1). Seed initial sand.
   gravityDir = +1;
@@ -360,20 +451,36 @@ void setup() {
 }
 
 void loop() {
-  // maybeFlipFromIMU(); // Commented out for now
-  static uint32_t lastSandStep = 0;
   static uint32_t lastFallStep = 0;
+  static uint32_t lastTiltCheck = 0;
   uint32_t now = millis();
 
-  // Only update sand state when not falling
-  if (!isFalling && now - lastSandStep >= STEP_MS) {
-    lastSandStep = now;
+  // Check tilt every 100ms
+  if (now - lastTiltCheck >= 100) {
+    lastTiltCheck = now;
+    checkTilt();
+  }
+
+  // Only run countdown when active
+  if (currentState == COUNTDOWN && now - lastFallStep >= FALL_STEP_MS) {
+    lastFallStep = now;
+    bool touched = advanceBottomFallingGrain();
+    if (touched) {
+      performSandStep();
+      if (!topFilled && fallingGrain >= GRAINS && !melodyPlayed) {
+        melodyPlayed = true;
+        currentState = COMPLETED;
+        playCompletionMelody();
+        Serial.println("Countdown completed! Tilt again to restart.");
+      }
+    }
     updateSandLogic();
   }
 
-  // Update falling animation at a faster rate
-  if (isFalling && now - lastFallStep >= FALL_STEP_MS) {
-    lastFallStep = now;
-    updateFallingAnimation();
+  // Handle standby state
+  if (currentState == STANDBY) {
+    // Show standby pattern or clear display
+    mx.clear();
+    delay(100);
   }
 }
