@@ -39,9 +39,17 @@ static void buzzerTone(unsigned int freq, unsigned int durationMs) {
 }
 
 static void playCompletionMelody() {
-  // Simple pleasant chime sequence (not copyrighted melody)
-  const unsigned int notes[] = { 988, 0, 988, 1319, 0, 1175, 988, 0, 784, 988, 0 };
-  const unsigned int lens[]  = { 150, 50, 150, 250, 50, 200, 200, 50, 200, 400, 50 };
+  // "Dancing in September" inspired jingle from Earth, Wind & Fire
+  // Melody captures the descending pattern: "Dan-cing in Sep-tem-ber"
+  // Notes: F5, E5, D5, C5, B4, A4, G4, F4
+  const unsigned int notes[] = { 
+    698, 659, 587, 523, 494, 440, 392, 349, 0 
+  };
+  // Durations: Mimic the rhythm of "Dan-cing in Sep-tem-ber"
+  // "Dan" (long), "cing" (short), "in" (short), "Sep" (medium), "tem" (short), "ber" (long)
+  const unsigned int lens[] = { 
+    200, 100, 100, 150, 100, 200, 0 
+  };
   const size_t count = sizeof(notes)/sizeof(notes[0]);
   for (size_t i = 0; i < count; i++) {
     buzzerTone(notes[i], lens[i]);
@@ -56,6 +64,7 @@ Adafruit_MPU6050 mpu;
 enum SystemState {
   STANDBY,      // Waiting for tilt to start
   COUNTDOWN,    // Sand is flowing
+  PAUSED,       // Laid on side; animation paused
   COMPLETED     // Song finished, waiting for tilt to restart
 };
 SystemState currentState = STANDBY;
@@ -98,12 +107,26 @@ uint16_t SAND_COUNT = 16; // Reduced for debugging
 // With current behavior: first bottom touch starts transfer (no increment),
 // then 64 increments occur. Each increment happens every 8 fall steps.
 // Total fall steps = 8 * (64 + 1) = 520.
-#define TARGET_DURATION_MS 15000
+#define TARGET_DURATION_MS 20000
 #define TOTAL_FALL_STEPS 520
 const uint16_t FALL_STEP_MS = (TARGET_DURATION_MS + (TOTAL_FALL_STEPS/2)) / TOTAL_FALL_STEPS; // rounded
 
 // Independent bottom falling-grain animation
 uint8_t bottomFallPhase = 0;       // 0..7 along the bottom diagonal
+
+// Global animation timer to support pause/resume without catch-up
+uint32_t lastAnimTickMs = 0;
+
+// Sideways hysteresis tracking
+bool lastIsSideways = false;
+uint32_t sidewaysStateChangeMs = 0;
+
+// Orientation memory - tracks the last stable orientation
+bool lastStableWasFlipped = false;
+
+
+
+
 
 // ---------------------- Helpers ----------------------
 
@@ -184,6 +207,7 @@ void printGridDebug() {
   switch(currentState) {
     case STANDBY: Serial.print("STANDBY"); break;
     case COUNTDOWN: Serial.print("COUNTDOWN"); break;
+    case PAUSED: Serial.print("PAUSED"); break;
     case COMPLETED: Serial.print("COMPLETED"); break;
   }
   Serial.print(" | Sand: ");
@@ -277,14 +301,26 @@ void resetSystem() {
   Serial.println("System reset - countdown started!");
 }
 
+
+
 // Encapsulated falling/transfer draw (does not advance counts)
 static void drawSandState() {
   clearGrid();
   
-  // Check if hourglass is upside down
+  // Check if hourglass is upside down using tilt angle (consistent with main logic)
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
-  bool isUpsideDown = (a.acceleration.z < -2.0);
+  float magnitude = sqrt(a.acceleration.x*a.acceleration.x + a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z);
+  float tiltAngle = 0;
+  if (magnitude > 0.1) {
+    float cosAngle = a.acceleration.z / magnitude;
+    if (cosAngle >= 0) {
+      tiltAngle = acos(cosAngle) * 180.0 / PI;
+    } else {
+      tiltAngle = 180.0 - acos(-cosAngle) * 180.0 / PI;
+    }
+  }
+  bool isUpsideDown = (tiltAngle > 165.0);
   
   if (topFilled) {
     if (isUpsideDown) {
@@ -341,10 +377,20 @@ static void drawSandState() {
 
 // Overlay the single falling grain on the appropriate diagonal
 static void drawBottomFallingGrain() {
-  // Check if hourglass is upside down
+  // Check if hourglass is upside down using tilt angle (consistent with main logic)
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
-  bool isUpsideDown = (a.acceleration.z < -2.0);
+  float magnitude = sqrt(a.acceleration.x*a.acceleration.x + a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z);
+  float tiltAngle = 0;
+  if (magnitude > 0.1) {
+    float cosAngle = a.acceleration.z / magnitude;
+    if (cosAngle >= 0) {
+      tiltAngle = acos(cosAngle) * 180.0 / PI;
+    } else {
+      tiltAngle = 180.0 - acos(-cosAngle) * 180.0 / PI;
+    }
+  }
+  bool isUpsideDown = (tiltAngle > 165.0);
   
   uint8_t y, x;
   
@@ -386,13 +432,17 @@ void stepSand() {
 }
 
 void updateSandLogic() {
+  // Don't update anything if paused
+  if (currentState == PAUSED)
+    return;
+  
   // Draw sand state
   stepSand();
   // Overlay independent falling grain
   drawBottomFallingGrain();
   // Render frame
   render();
-  printGridDebug();
+  // Removed: printGridDebug(); to avoid breaking single-line output
 
   // Auto-flip logic when bottom is full and stable
   if (isGridUnchanged()) {
@@ -417,57 +467,197 @@ void updateSandLogic() {
 
 // Check accelerometer for tilt detection
 void checkTilt() {
+  static SystemState lastRenderedState = STANDBY;
+  
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
-  // Calculate tilt angle from accelerometer data
-  // Tilt angle = arccos(|Z| / sqrt(X² + Y² + Z²))
   float xAccel = a.acceleration.x;
   float yAccel = a.acceleration.y;
   float zAccel = a.acceleration.z;
-  
-  // Calculate magnitude of acceleration vector
   float magnitude = sqrt(xAccel*xAccel + yAccel*yAccel + zAccel*zAccel);
-  
-  // Calculate tilt angle (0° = flat, 90° = vertical)
   float tiltAngle = 0;
-  if (magnitude > 0.1) { // Avoid division by zero
-    tiltAngle = acos(abs(zAccel) / magnitude) * 180.0 / PI;
+  if (magnitude > 0.1) {
+    // Calculate tilt angle from vertical (0° = upright, 180° = upside down)
+    // Use the Z-axis as the reference for vertical orientation
+    float cosAngle = zAccel / magnitude;
+    
+    // Handle angles beyond 90° by considering the sign of Z-acceleration
+    if (cosAngle >= 0) {
+      // 0° to 90°: upright to horizontal
+      tiltAngle = acos(cosAngle) * 180.0 / PI;
+    } else {
+      // 90° to 180°: horizontal to upside down
+      tiltAngle = 180.0 - acos(-cosAngle) * 180.0 / PI;
+    }
   }
+
+  // Improved tilt detection with clear, non-overlapping zones
+  // 0°-15°: UPRIGHT (stable) | 15°-75°: TILTED (unstable) | 75°-120°: SIDEWAYS (pause) | 120°-165°: CANCELED | 165°-180°: FLIPPED (stable)
+  // Zone detection uses orientation memory: if last stable was FLIPPED, use complement angle; if UPRIGHT, use normal angle
+  // CANCELED zone (120°-165°) cancels countdown and waits for UPRIGHT or FLIPPED position
+  // Both UPRIGHT and FLIPPED are considered stable positions for system behavior
   
-  // Detect if hourglass is flipped (upside down)
-  // When Z is negative, it's upside down
-  bool isUpsideDown = (zAccel < -2.0); // Threshold to avoid false triggers
+  // Use orientation memory to determine whether to use normal or complement angle
+  // If last stable was FLIPPED, use complement angle; if UPRIGHT, use normal angle
+  // Orientation memory only updates when actually reaching stable positions (UPRIGHT or FLIPPED)
+  float effectiveTiltAngle = tiltAngle;
   
-  // Debug: print tilt angle (overwrite same line)
+  bool isUpsideDown = (tiltAngle > 165.0);                        // 165° to 180°: upside down (raw angle)
+  
+  // Determine which angle to use for zone detection based on last stable orientation
+  if (lastStableWasFlipped) {
+    // Last stable was FLIPPED - use complement angle for consistent zone behavior
+    effectiveTiltAngle = 180.0 - tiltAngle;
+  }
+  // If last stable was UPRIGHT, use normal angle (effectiveTiltAngle = tiltAngle)
+  
+  // Now calculate zones using the appropriate angle
+  // When last stable was FLIPPED: effectiveTiltAngle = 180° - tiltAngle (so 165° becomes 15°, 170° becomes 10°, etc.)
+  // When last stable was UPRIGHT: effectiveTiltAngle = tiltAngle (normal behavior)
+  bool isUpright = (effectiveTiltAngle < 15.0);                    // 0° to 15°: upright (or flipped equivalent)
+  bool isSideways = (effectiveTiltAngle > 75.0 && effectiveTiltAngle < 120.0); // 75° to 120°: sideways (extended)
+  
+  // Stable positions: both UPRIGHT (0°-15°) and FLIPPED (165°-180°) are stable
+  // Check both the effective angle (for zone-based stability) and raw upside-down detection
+  bool isStable = (effectiveTiltAngle < 15.0) || isUpsideDown;
+  
+  // Reset orientation memory only when switching between stable positions
+  // Only update when we're actually in a stable position (UPRIGHT or FLIPPED)
+  if (isStable && lastStableWasFlipped != isUpsideDown) {
+    lastStableWasFlipped = isUpsideDown;
+    Serial.println(); // New line for orientation change
+    Serial.print("*** ORIENTATION MEMORY CHANGED: ");
+    Serial.print(lastStableWasFlipped ? "FLIPPED" : "UPRIGHT");
+    Serial.println(" ***");
+  }
+
+
+  
+  uint32_t now = millis();
+
+
+  
+  if (isSideways != lastIsSideways) {
+    lastIsSideways = isSideways;
+    sidewaysStateChangeMs = now;
+  }
+  bool sidewaysStable = (now - sidewaysStateChangeMs >= 150); // Reduced from 200ms to 150ms for faster response
+
   Serial.print("\rTilt: ");
   Serial.print(tiltAngle, 1);
-  Serial.print("° | Z: ");
+  if (isUpsideDown) {
+    Serial.print("° (");
+    Serial.print(effectiveTiltAngle, 1);
+    Serial.print("° flipped)");
+  } else {
+    Serial.print("°");
+  }
+  Serial.print(" | Z: ");
   Serial.print(zAccel, 2);
-  Serial.print(" m/s² | Upside down: ");
-  Serial.print(isUpsideDown ? "YES" : "NO");
-  
-  // Consider stable if tilt is close to 0° (flat) or 180° (upside down)
-  bool isStable = (tiltAngle < 15.0) || (tiltAngle > 165.0);
-  
+  Serial.print(" | Zones: ");
+  Serial.print(isUpright ? "UPRIGHT" : (isSideways ? "SIDEWAYS" : "TILTED"));
+  Serial.print(" | Mem:");
+  Serial.print(lastStableWasFlipped ? "FLIP" : "UPRT");
+  Serial.print(" | State: ");
+  switch(currentState) {
+    case STANDBY: Serial.print("STANDBY"); break;
+    case COUNTDOWN: Serial.print("COUNTDOWN"); break;
+    case PAUSED: Serial.print("PAUSED"); break;
+    case COMPLETED: Serial.print("COMPLETED"); break;
+  }
+
+  // Check for state changes and render accordingly
+  if (currentState != lastRenderedState) {
+    lastRenderedState = currentState;
+    if (currentState == PAUSED) {
+      // When entering PAUSED state, render once and keep it frozen
+      render();
+      Serial.println("Display frozen in PAUSED state");
+    }
+  }
+
   if (currentState == STANDBY) {
-    // Start countdown when tilted away from stable positions
-    if (!isStable) {
+    if (isSideways && sidewaysStable) {
+      currentState = PAUSED;
+      lastAnimTickMs = now;
+      Serial.println(" | PAUSED");
+      Serial.println("*** PAUSED STATE TRIGGERED FROM STANDBY ***");
+    } else if (effectiveTiltAngle > 120.0 && effectiveTiltAngle < 165.0) {
+      // In CANCELED zone - stay in STANDBY until reaching UPRIGHT or FLIPPED
+      Serial.println(" | CANCELED zone - Waiting for stable position");
+    } else if (effectiveTiltAngle >= 15.0 && effectiveTiltAngle <= 75.0) {
+      // Start countdown from TILTED zone (15°-75° effective angle, works for both orientations)
       Serial.println(" | TILT DETECTED - Starting countdown!");
       resetSystem();
+      lastAnimTickMs = now;
+    } else if (isStable) {
+      Serial.println(" | Stable position");
     } else {
-      Serial.print(" | Stable position");
+      Serial.println(" | Other position");
+    }
+  } else if (currentState == COUNTDOWN) {
+    // Check if hourglass is in CANCELED zone - cancel countdown and wait for stable position
+    if (effectiveTiltAngle > 120.0 && effectiveTiltAngle < 165.0) {
+      currentState = STANDBY;
+      topFilled = true;
+      fallingGrain = 0;
+      bottomFallPhase = 0;
+      unchangedSteps = 0;
+      melodyPlayed = false;
+      clearGrid();
+      seedSandBottom();
+      Serial.println(" | COUNTDOWN CANCELLED - In CANCELED zone!");
+      Serial.println("*** COUNTDOWN CANCELLED - Waiting for UPRIGHT or FLIPPED ***");
+    }
+    // Allow pausing from COUNTDOWN state when laid sideways
+    else if (isSideways && sidewaysStable) {
+      currentState = PAUSED;
+      lastAnimTickMs = now;
+      Serial.println(" | PAUSED");
+      Serial.println("*** PAUSED STATE TRIGGERED FROM COUNTDOWN ***");
+    } else {
+      Serial.println(); // Just add newline for COUNTDOWN state
+    }
+  } else if (currentState == PAUSED) {
+    if (!isSideways && sidewaysStable) {
+      currentState = COUNTDOWN;
+      lastAnimTickMs = now;
+      Serial.println(" | RESUME COUNTDOWN");
+      Serial.println("*** RESUMING FROM PAUSED STATE ***");
+      Serial.println("Display active - countdown resumed");
+    } else {
+      Serial.println(" | PAUSED");
     }
   } else if (currentState == COMPLETED) {
-    // Restart when tilted away from stable positions
-    if (!isStable) {
+    // Check if hourglass is in CANCELED zone - reset to standby and wait for stable position
+    if (effectiveTiltAngle > 120.0 && effectiveTiltAngle < 165.0) {
+      currentState = STANDBY;
+      topFilled = true;
+      fallingGrain = 0;
+      bottomFallPhase = 0;
+      unchangedSteps = 0;
+      melodyPlayed = false;
+      clearGrid();
+      seedSandBottom();
+      Serial.println(" | RESET - In CANCELED zone!");
+      Serial.println("*** RESET - Waiting for UPRIGHT or FLIPPED ***");
+    }
+    else if (isSideways && sidewaysStable) {
+      currentState = PAUSED;
+      lastAnimTickMs = now;
+      Serial.println(" | PAUSED");
+      Serial.println("*** PAUSED STATE TRIGGERED FROM COMPLETED ***");
+    } else if (effectiveTiltAngle >= 15.0 && effectiveTiltAngle <= 75.0) {
+      // Allow countdown to restart from TILTED zone (15°-75° effective angle, works for both orientations)
       Serial.println(" | TILT DETECTED - Restarting countdown!");
       resetSystem();
+      lastAnimTickMs = now;
+    } else if (isStable) {
+      Serial.println(" | Stable position");
     } else {
-      Serial.print(" | Stable position");
+      Serial.println(" | Other position");
     }
-  } else {
-    Serial.print(" | Countdown active");
   }
 }
 
@@ -501,11 +691,10 @@ void setup() {
   // Start with gravity "down" (+1). Seed initial sand.
   gravityDir = +1;
   initGrainOrder();
-  //seedSandBottom();
+  seedSandBottom(); // Uncommented to initialize sand state
 }
 
 void loop() {
-  static uint32_t lastFallStep = 0;
   static uint32_t lastTiltCheck = 0;
   uint32_t now = millis();
 
@@ -515,25 +704,29 @@ void loop() {
     checkTilt();
   }
 
+  // If paused, don't do anything - keep display frozen
+  if (currentState == PAUSED) {
+    return; // Exit early, don't advance anything
+  }
+
   // Only run countdown when active
-  if (currentState == COUNTDOWN && now - lastFallStep >= FALL_STEP_MS) {
-    lastFallStep = now;
+  if (currentState == COUNTDOWN && now - lastAnimTickMs >= FALL_STEP_MS) {
+    lastAnimTickMs = now;
     bool touched = advanceBottomFallingGrain();
-    if (touched) {
-      performSandStep();
-      if (!topFilled && fallingGrain >= GRAINS && !melodyPlayed) {
-        melodyPlayed = true;
-        currentState = COMPLETED;
-        playCompletionMelody();
-        Serial.println("Countdown completed! Tilt again to restart.");
+      if (touched) {
+        performSandStep();
+        if (!topFilled && fallingGrain >= GRAINS && !melodyPlayed) {
+          melodyPlayed = true;
+          currentState = COMPLETED;
+          playCompletionMelody();
+          Serial.println("Countdown completed! Tilt again to restart.");
+        }
       }
-    }
     updateSandLogic();
   }
 
   // Handle standby state
   if (currentState == STANDBY) {
-    // Show standby pattern or clear display
     mx.clear();
     delay(100);
   }
