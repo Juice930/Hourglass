@@ -176,6 +176,17 @@ uint32_t sidewaysStateChangeMs = 0;
 // Orientation memory - tracks the last stable orientation
 bool lastStableWasFlipped = false;
 
+// Shake detection variables
+float lastAccelMagnitude = 0;
+uint32_t lastShakeCheck = 0;
+const uint16_t SHAKE_CHECK_INTERVAL = 50; // Check shake every 50ms
+const float SHAKE_THRESHOLD = 15.0; // m/s² threshold for shake detection
+const uint8_t SHAKE_DEBOUNCE_MS = 500; // Debounce shake detection
+uint32_t lastShakeDetected = 0;
+
+// Track if user has been in stable position since completion (no longer needed)
+// bool hasBeenInStablePositionSinceCompletion = false;
+
 
 
 
@@ -279,6 +290,29 @@ bool isGridUnchanged() {
   return true;
 }
 
+// Shake detection function
+bool detectShake(float currentMagnitude) {
+  uint32_t now = millis();
+  
+  // Only check shake at regular intervals
+  if (now - lastShakeCheck < SHAKE_CHECK_INTERVAL) {
+    return false;
+  }
+  lastShakeCheck = now;
+  
+  // Calculate acceleration change
+  float accelChange = abs(currentMagnitude - lastAccelMagnitude);
+  lastAccelMagnitude = currentMagnitude;
+  
+  // Check if acceleration change exceeds threshold and debounce time has passed
+  if (accelChange > SHAKE_THRESHOLD && (now - lastShakeDetected) > SHAKE_DEBOUNCE_MS) {
+    lastShakeDetected = now;
+    return true;
+  }
+  
+  return false;
+}
+
 // Fill grainOrder with diagonal pattern (top right to bottom left)
 void initGrainOrder() {
   uint8_t idx = 0;
@@ -362,6 +396,7 @@ void resetSystem() {
   bottomFallPhase = 0;
   unchangedSteps = 0;
   melodyPlayed = false;
+  // hasBeenInStablePositionSinceCompletion = false; // Reset stable position flag (no longer needed)
   clearGrid();
   Serial.println("System reset - countdown started!");
 }
@@ -537,75 +572,48 @@ void checkTilt() {
     // Use the Z-axis as the reference for vertical orientation
     float cosAngle = zAccel / magnitude;
     
-    // Handle angles beyond 90° by considering the sign of Z-acceleration
-    if (cosAngle >= 0) {
-      // 0° to 90°: upright to horizontal
-      tiltAngle = acos(cosAngle) * 180.0 / PI;
-    } else {
-      // 90° to 180°: horizontal to upside down
-      tiltAngle = 180.0 - acos(-cosAngle) * 180.0 / PI;
-    }
+    // Always calculate the actual tilt angle from vertical (0° = upright, 90° = horizontal)
+    // The sign of Z-acceleration tells us which side we're tilted, but the angle is always positive
+    tiltAngle = acos(abs(cosAngle)) * 180.0 / PI;
   }
 
   // Improved tilt detection with clear, non-overlapping zones
-  // 0°-15°: UPRIGHT (stable) | 15°-75°: TILTED (unstable) | 75°-120°: SIDEWAYS (pause) | 120°-165°: CANCELED | 165°-180°: FLIPPED (stable)
-  // Zone detection uses orientation memory: if last stable was FLIPPED, use complement angle; if UPRIGHT, use normal angle
-  // CANCELED zone (120°-165°) cancels countdown and waits for UPRIGHT or FLIPPED position
+  // 0°-20°: UPRIGHT (stable) | 20°-70°: TILTED (unstable) | 70°-120°: SIDEWAYS (pause)
+  // Zone detection uses orientation memory: both orientations use the same angle ranges
   // Both UPRIGHT and FLIPPED are considered stable positions for system behavior
+  // Countdown cancellation is now handled by shake detection instead of angle zones
   
-  // Use orientation memory to determine whether to use normal or complement angle
-  // If last stable was FLIPPED, use complement angle; if UPRIGHT, use normal angle
-  // Orientation memory only updates when actually reaching stable positions (UPRIGHT or FLIPPED)
-  float effectiveTiltAngle = tiltAngle;
+  // Use orientation memory to determine which angle to use for zone detection
+  // Both orientations now use the same tilt angle ranges for consistent behavior
+  float  effectiveTiltAngle = tiltAngle;
   
-  bool isUpsideDown = (tiltAngle > 165.0);                        // 165° to 180°: upside down (raw angle)
+  // Detect upside down by checking if Z-acceleration is negative (pointing down)
+  bool isUpsideDown = (zAccel < 0);
   
-  // Determine which angle to use for zone detection based on last stable orientation
-  if (lastStableWasFlipped) {
-    // Last stable was FLIPPED - use complement angle for consistent zone behavior
-    // This means: when tilted 10° from vertical, effectiveTiltAngle = 170° (which should be treated as "upright")
-    effectiveTiltAngle = 180.0 - tiltAngle;
-  }
-  // If last stable was UPRIGHT, use normal angle (effectiveTiltAngle = tiltAngle)
+  // Both orientations now use the same tilt angle ranges
+  // effectiveTiltAngle = tiltAngle for both UPRIGHT and FLIPPED orientations
   
-  // Now calculate zones using the appropriate angle
-  // When last stable was FLIPPED: effectiveTiltAngle = 180° - tiltAngle (so 165° becomes 15°, 170° becomes 10°, etc.)
-  // When last stable was UPRIGHT: effectiveTiltAngle = tiltAngle (normal behavior)
-  bool isUpright;
-  if (lastStableWasFlipped) {
-    // In flipped orientation: complement angles near 180° are "upright"
-    // effectiveTiltAngle = 180° - tiltAngle, so 8° becomes 172°, 10° becomes 170°
-    isUpright = (effectiveTiltAngle > 165.0); // 165°-180° is upright in flipped orientation
-  } else {
-    // In normal orientation: angles near 0° are "upright"
-    isUpright = (effectiveTiltAngle < 15.0); // 0°-15° is upright in normal orientation
-  }
+  // Zone detection logic: both orientations use the same logic
+  // - Upright orientation: 0°-20° is upright (stable)
+  // - Flipped orientation: 0°-20° is upright (stable) - same angle ranges
+  bool isUpright = (effectiveTiltAngle < 20.0);
   
   // Debug: Show the actual values being used for zone detection
   Serial.print(" | isUpright:"); Serial.print(isUpright ? "YES" : "NO");
   Serial.print(" | effectiveTilt:"); Serial.print(effectiveTiltAngle, 1);
-  Serial.print(" | stableCalc:"); Serial.print(lastStableWasFlipped ? "FLIP>165" : "UPRT<15");
+  Serial.print(" | stableCalc:"); Serial.print(lastStableWasFlipped ? "FLIP<20" : "UPRT<20");
   
-  bool isSideways = (effectiveTiltAngle > 75.0 && effectiveTiltAngle < 120.0); // 75° to 120°: sideways (extended)
+  bool isSideways = (effectiveTiltAngle > 70.0 && effectiveTiltAngle < 120.0); // 70° to 120°: sideways (extended)
   
   // Debug: Show both raw and effective angles for troubleshooting
   if (lastStableWasFlipped) {
-    Serial.print(" | Raw: "); Serial.print(tiltAngle, 1); Serial.print("° → Effective: "); Serial.print(effectiveTiltAngle, 1); Serial.print("°");
+    Serial.print(" | Raw: "); Serial.print(tiltAngle, 1); Serial.print("° → Effective: "); Serial.print(effectiveTiltAngle, 1); Serial.print("° (FLIP)");
   }
   
-    // Stable positions: both UPRIGHT (0°-15°) and FLIPPED (165°-180°) are stable
-  // Check both the effective angle (for zone-based stability) and raw upside-down detection
-  bool isStable;
-  if (lastStableWasFlipped) {
-    // In flipped orientation: effectiveTiltAngle > 165° means we're stable (upright in flipped world)
-    isStable = (effectiveTiltAngle > 165.0) || isUpsideDown;
-  } else {
-    // In normal orientation: effectiveTiltAngle < 15° means we're stable (upright in normal world)
-    isStable = (effectiveTiltAngle < 15.0) || isUpsideDown;
-  }
-  // Additional debug for orientation memory
-  Serial.print(" | Stable:"); Serial.print(isStable ? "YES" : "NO");
-  Serial.print(" | UpsideDown:"); Serial.print(isUpsideDown ? "YES" : "NO");
+                             // Stability detection: both orientations use the same logic
+     // - Upright orientation: effectiveTiltAngle < 20.0 is stable
+     // - Flipped orientation: effectiveTiltAngle < 20.0 is stable (same angle ranges)
+     bool isStable = (effectiveTiltAngle < 20.0) || isUpsideDown;
   
 
   
@@ -630,6 +638,11 @@ void checkTilt() {
       Serial.print(lastStableWasFlipped ? "FLIPPED" : "UPRIGHT");
       Serial.println(" ***");
       wasStable = true;
+      
+             // Show entering stable mode message
+       if (currentState == COMPLETED) {
+         Serial.println("*** READY TO RESTART - Return to stable position ***");
+       }
     }
   } else {
     // Reset stable flag when leaving stable mode
@@ -668,8 +681,15 @@ void checkTilt() {
     case STANDBY: Serial.print("STANDBY"); break;
     case COUNTDOWN: Serial.print("COUNTDOWN"); break;
     case PAUSED: Serial.print("PAUSED"); break;
-    case COMPLETED: Serial.print("COMLPETED"); break;
+    case COMPLETED: Serial.print("COMPLETED"); break;
   }
+  Serial.print(" | Stable:");
+  Serial.print(isStable ? "YES" : "NO");
+  Serial.print(" | UpsideDown:");
+  Serial.print(isUpsideDown ? "YES" : "NO");
+  
+  // Add shake detection debug (but don't call detectShake here to avoid double-calling)
+  // Shake detection is handled in the state machine logic below
 
   // Check for state changes and render accordingly
   if (currentState != lastRenderedState) {
@@ -687,11 +707,8 @@ void checkTilt() {
       lastAnimTickMs = now;
       Serial.println(" | PAUSED");
       Serial.println("*** PAUSED STATE TRIGGERED FROM STANDBY ***");
-    } else if (effectiveTiltAngle > 120.0 && effectiveTiltAngle < 165.0) {
-      // In CANCELED zone - stay in STANDBY until reaching UPRIGHT or FLIPPED
-      Serial.println(" | CANCELED zone - Waiting for stable position");
-    } else if (effectiveTiltAngle >= 15.0 && effectiveTiltAngle <= 75.0) {
-      // Start countdown from TILTED zone (15°-75° effective angle, works for both orientations)
+    } else if (effectiveTiltAngle >= 20.0 && effectiveTiltAngle <= 70.0) {
+      // Start countdown from TILTED zone (20°-70° effective angle, works for both orientations)
       Serial.println(" | TILT DETECTED - Starting countdown!");
       resetSystem();
       lastAnimTickMs = now;
@@ -701,8 +718,8 @@ void checkTilt() {
       Serial.println(" | Other position");
     }
   } else if (currentState == COUNTDOWN) {
-    // Check if hourglass is in CANCELED zone - cancel countdown and wait for stable position
-    if (effectiveTiltAngle > 120.0 && effectiveTiltAngle < 165.0) {
+    // Check for shake to cancel countdown
+    if (detectShake(magnitude)) {
       currentState = STANDBY;
       topFilled = true;
       fallingGrain = 0;
@@ -711,8 +728,8 @@ void checkTilt() {
       melodyPlayed = false;
       clearGrid();
       seedSandBottom();
-      Serial.println(" | COUNTDOWN CANCELLED - In CANCELED zone!");
-      Serial.println("*** COUNTDOWN CANCELLED - Waiting for UPRIGHT or FLIPPED ***");
+      Serial.println(" | COUNTDOWN CANCELLED - Shake detected!");
+      Serial.println("*** COUNTDOWN CANCELLED - Shake detected! ***");
     }
     // Allow pausing from COUNTDOWN state when laid sideways
     else if (isSideways && sidewaysStable) {
@@ -724,7 +741,19 @@ void checkTilt() {
       Serial.println(); // Just add newline for COUNTDOWN state
     }
   } else if (currentState == PAUSED) {
-    if (!isSideways && sidewaysStable) {
+    // Check for shake to cancel from paused state
+    if (detectShake(magnitude)) {
+      currentState = STANDBY;
+      topFilled = true;
+      fallingGrain = 0;
+      bottomFallPhase = 0;
+      unchangedSteps = 0;
+      melodyPlayed = false;
+      clearGrid();
+      seedSandBottom();
+      Serial.println(" | CANCELLED FROM PAUSED - Shake detected!");
+      Serial.println("*** CANCELLED FROM PAUSED - Shake detected! ***");
+    } else if (!isSideways && sidewaysStable) {
       currentState = COUNTDOWN;
       lastAnimTickMs = now;
       Serial.println(" | RESUME COUNTDOWN");
@@ -734,8 +763,8 @@ void checkTilt() {
       Serial.println(" | PAUSED");
     }
   } else if (currentState == COMPLETED) {
-    // Check if hourglass is in CANCELED zone - reset to standby and wait for stable position
-    if (effectiveTiltAngle > 120.0 && effectiveTiltAngle < 165.0) {
+    // Check for shake to reset to standby
+    if (detectShake(magnitude)) {
       currentState = STANDBY;
       topFilled = true;
       fallingGrain = 0;
@@ -744,23 +773,29 @@ void checkTilt() {
       melodyPlayed = false;
       clearGrid();
       seedSandBottom();
-      Serial.println(" | RESET - In CANCELED zone!");
-      Serial.println("*** RESET - Waiting for UPRIGHT or FLIPPED ***");
+      Serial.println(" | RESET - Shake detected!");
+      Serial.println("*** RESET - Shake detected! ***");
     }
     else if (isSideways && sidewaysStable) {
       currentState = PAUSED;
       lastAnimTickMs = now;
       Serial.println(" | PAUSED");
       Serial.println("*** PAUSED STATE TRIGGERED FROM COMPLETED ***");
-    } else if (effectiveTiltAngle >= 15.0 && effectiveTiltAngle <= 75.0) {
-      // Allow countdown to restart from TILTED zone (15°-75° effective angle, works for both orientations)
-      Serial.println(" | TILT DETECTED - Restarting countdown!");
-      resetSystem();
-      lastAnimTickMs = now;
     } else if (isStable) {
-      Serial.println(" | Stable position");
+      // When reaching stable position from COMPLETED, transition to STANDBY
+      // This allows the user to restart countdown from STANDBY state
+      currentState = STANDBY;
+      topFilled = true;
+      fallingGrain = 0;
+      bottomFallPhase = 0;
+      unchangedSteps = 0;
+      melodyPlayed = false;
+      clearGrid();
+      seedSandBottom();
+      Serial.println(" | Transitioning to STANDBY - Ready to restart countdown!");
+      Serial.println("*** COMPLETED → STANDBY - Tilt to start new countdown ***");
     } else {
-      Serial.println(" | Other position");
+      Serial.println(" | Return to stable position to restart countdown");
     }
   }
 }
@@ -790,10 +825,17 @@ void setup() {
     mpu.setGyroRange(MPU6050_RANGE_500_DEG);
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
     Serial.println("MPU6050 initialized. Tilt to start countdown.");
+    Serial.println("Shake to cancel countdown from any state.");
   }
 
   // Start with upright orientation. Seed initial sand.
   lastStableWasFlipped = false;
+  
+  // Initialize shake detection
+  lastAccelMagnitude = 0;
+  lastShakeCheck = 0;
+  lastShakeDetected = 0;
+  
   initGrainOrder();
   seedSandBottom(); // Uncommented to initialize sand state
 }
