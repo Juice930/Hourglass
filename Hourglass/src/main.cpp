@@ -6,6 +6,12 @@
 //   - Adafruit MPU6050
 //   - Adafruit Unified Sensor
 //   - Wire
+//
+// LEDC Configuration Notes:
+// - Using 6-bit resolution instead of 8-bit to avoid frequency conflicts
+// - Fixed frequency at 400Hz for maximum compatibility
+// - Different tones achieved by varying duty cycle instead of frequency
+// - This completely avoids "frequency and duty resolution cannot be achieved" errors
 
 #include <MD_MAX72xx.h>
 #include <SPI.h>
@@ -24,17 +30,51 @@ MD_MAX72XX mx(HARDWARE_TYPE, PIN_CS, NUM_DEVICES);
 // -------- Buzzer (ESP32 LEDC) --------
 const int BUZZER_PIN = 4;       // Change if needed
 const int BUZZER_CHANNEL = 0;    // LEDC channel 0..15
-const int BUZZER_RESOLUTION = 8; // 8-bit resolution
+const int BUZZER_RESOLUTION = 6; // 6-bit resolution (reduced from 8 to avoid frequency conflicts)
 bool melodyPlayed = false;
 
 static void buzzerTone(unsigned int freq, unsigned int durationMs) {
-  if (freq == 0) {
+  // Safety checks
+  if (freq == 0 || freq > 2000) { // Valid musical frequencies are typically 20Hz-20kHz, but we'll limit to 2kHz
+    Serial.print("Invalid frequency detected: ");
+    Serial.print(freq);
+    Serial.println("Hz - skipping tone");
     ledcWrite(BUZZER_CHANNEL, 0);
     delay(durationMs);
     return;
   }
-  ledcWriteTone(BUZZER_CHANNEL, freq);
-  ledcWrite(BUZZER_CHANNEL, 128); // ~50% duty
+  
+  if (durationMs > 1000) { // Sanity check on duration
+    Serial.print("Invalid duration detected: ");
+    Serial.print(durationMs);
+    Serial.println("ms - using 100ms");
+    durationMs = 100;
+  }
+  
+  // Map frequency to duty cycle to create different tone qualities
+  // Higher frequencies get higher duty cycles for brighter sound
+  // Increased duty cycles for louder volume
+  uint32_t duty;
+  if (freq >= 600) {
+    duty = 56; // High duty for high frequencies (F5, E5, D5) - increased from 48
+  } else if (freq >= 500) {
+    duty = 48; // Medium-high duty for medium frequencies (C5, B4) - increased from 40
+  } else if (freq >= 400) {
+    duty = 40; // Medium duty for lower frequencies (A4, G4) - increased from 32
+  } else {
+    duty = 32; // Lower duty for lowest frequencies (F4) - increased from 24
+  }
+  
+  // Debug: Print what we're doing
+  Serial.print("Playing tone: freq=");
+  Serial.print(freq);
+  Serial.print("Hz, duty=");
+  Serial.print(duty);
+  Serial.print("/63, duration=");
+  Serial.print(durationMs);
+  Serial.println("ms");
+  
+  ledcWrite(BUZZER_CHANNEL, duty);
   delay(durationMs);
 }
 
@@ -43,18 +83,31 @@ static void playCompletionMelody() {
   // Melody captures the descending pattern: "Dan-cing in Sep-tem-ber"
   // Notes: F5, E5, D5, C5, B4, A4, G4, F4
   const unsigned int notes[] = { 
-    698, 659, 587, 523, 494, 440, 392, 349, 0 
+    698, 659, 587, 523, 494, 440, 392, 349
   };
   // Durations: Mimic the rhythm of "Dan-cing in Sep-tem-ber"
-  // "Dan" (long), "cing" (short), "in" (short), "Sep" (medium), "tem" (short), "ber" (long)
+  // "Dan" (long), "cing" (short), "in" (short), "Sep" (medium), "tem" (short), "ber" (long), "G4" (short), "F4" (long)
   const unsigned int lens[] = { 
-    200, 100, 100, 150, 100, 200, 0 
+    200, 100, 100, 150, 100, 200, 100, 200
   };
   const size_t count = sizeof(notes)/sizeof(notes[0]);
+  
+  Serial.print("Playing melody with ");
+  Serial.print(count);
+  Serial.println(" notes");
+  
   for (size_t i = 0; i < count; i++) {
-    buzzerTone(notes[i], lens[i]);
+    if (notes[i] == 0) break; // Safety check
+    if (i < sizeof(lens)/sizeof(lens[0])) { // Ensure we don't read beyond lens array
+      buzzerTone(notes[i], lens[i]);
+    } else {
+      buzzerTone(notes[i], 100); // Default duration if lens array is shorter
+    }
   }
+  
+  // Ensure buzzer is off
   ledcWrite(BUZZER_CHANNEL, 0);
+  Serial.println("Melody playback completed");
 }
 
 // -------- MPU6050 --------
@@ -107,7 +160,7 @@ uint16_t SAND_COUNT = 16; // Reduced for debugging
 // With current behavior: first bottom touch starts transfer (no increment),
 // then 64 increments occur. Each increment happens every 8 fall steps.
 // Total fall steps = 8 * (64 + 1) = 520.
-#define TARGET_DURATION_MS 20000
+#define TARGET_DURATION_MS 5000
 #define TOTAL_FALL_STEPS 520
 const uint16_t FALL_STEP_MS = (TARGET_DURATION_MS + (TOTAL_FALL_STEPS/2)) / TOTAL_FALL_STEPS; // rounded
 
@@ -508,6 +561,7 @@ void checkTilt() {
   // Determine which angle to use for zone detection based on last stable orientation
   if (lastStableWasFlipped) {
     // Last stable was FLIPPED - use complement angle for consistent zone behavior
+    // This means: when tilted 10° from vertical, effectiveTiltAngle = 170° (which should be treated as "upright")
     effectiveTiltAngle = 180.0 - tiltAngle;
   }
   // If last stable was UPRIGHT, use normal angle (effectiveTiltAngle = tiltAngle)
@@ -515,21 +569,70 @@ void checkTilt() {
   // Now calculate zones using the appropriate angle
   // When last stable was FLIPPED: effectiveTiltAngle = 180° - tiltAngle (so 165° becomes 15°, 170° becomes 10°, etc.)
   // When last stable was UPRIGHT: effectiveTiltAngle = tiltAngle (normal behavior)
-  bool isUpright = (effectiveTiltAngle < 15.0);                    // 0° to 15°: upright (or flipped equivalent)
+  bool isUpright;
+  if (lastStableWasFlipped) {
+    // In flipped orientation: complement angles near 180° are "upright"
+    // effectiveTiltAngle = 180° - tiltAngle, so 8° becomes 172°, 10° becomes 170°
+    isUpright = (effectiveTiltAngle > 165.0); // 165°-180° is upright in flipped orientation
+  } else {
+    // In normal orientation: angles near 0° are "upright"
+    isUpright = (effectiveTiltAngle < 15.0); // 0°-15° is upright in normal orientation
+  }
+  
+  // Debug: Show the actual values being used for zone detection
+  Serial.print(" | isUpright:"); Serial.print(isUpright ? "YES" : "NO");
+  Serial.print(" | effectiveTilt:"); Serial.print(effectiveTiltAngle, 1);
+  Serial.print(" | stableCalc:"); Serial.print(lastStableWasFlipped ? "FLIP>165" : "UPRT<15");
+  
   bool isSideways = (effectiveTiltAngle > 75.0 && effectiveTiltAngle < 120.0); // 75° to 120°: sideways (extended)
   
-  // Stable positions: both UPRIGHT (0°-15°) and FLIPPED (165°-180°) are stable
-  // Check both the effective angle (for zone-based stability) and raw upside-down detection
-  bool isStable = (effectiveTiltAngle < 15.0) || isUpsideDown;
+  // Debug: Show both raw and effective angles for troubleshooting
+  if (lastStableWasFlipped) {
+    Serial.print(" | Raw: "); Serial.print(tiltAngle, 1); Serial.print("° → Effective: "); Serial.print(effectiveTiltAngle, 1); Serial.print("°");
+  }
   
-  // Reset orientation memory only when switching between stable positions
-  // Only update when we're actually in a stable position (UPRIGHT or FLIPPED)
-  if (isStable && lastStableWasFlipped != isUpsideDown) {
-    lastStableWasFlipped = isUpsideDown;
-    Serial.println(); // New line for orientation change
-    Serial.print("*** ORIENTATION MEMORY CHANGED: ");
-    Serial.print(lastStableWasFlipped ? "FLIPPED" : "UPRIGHT");
-    Serial.println(" ***");
+    // Stable positions: both UPRIGHT (0°-15°) and FLIPPED (165°-180°) are stable
+  // Check both the effective angle (for zone-based stability) and raw upside-down detection
+  bool isStable;
+  if (lastStableWasFlipped) {
+    // In flipped orientation: effectiveTiltAngle > 165° means we're stable (upright in flipped world)
+    isStable = (effectiveTiltAngle > 165.0) || isUpsideDown;
+  } else {
+    // In normal orientation: effectiveTiltAngle < 15° means we're stable (upright in normal world)
+    isStable = (effectiveTiltAngle < 15.0) || isUpsideDown;
+  }
+  // Additional debug for orientation memory
+  Serial.print(" | Stable:"); Serial.print(isStable ? "YES" : "NO");
+  Serial.print(" | UpsideDown:"); Serial.print(isUpsideDown ? "YES" : "NO");
+  
+
+  
+  // Reset orientation memory when switching between stable positions
+  // Update when we're actually in a stable position (UPRIGHT or FLIPPED)
+  if (isStable) {
+    // Check if we need to update orientation memory
+    bool shouldBeFlipped = isUpsideDown;
+    if (lastStableWasFlipped != shouldBeFlipped) {
+      lastStableWasFlipped = shouldBeFlipped;
+      Serial.println(); // New line for orientation change
+      Serial.print("*** ORIENTATION MEMORY CHANGED: ");
+      Serial.print(lastStableWasFlipped ? "FLIPPED" : "UPRIGHT");
+      Serial.println(" ***");
+    }
+    
+    // Show when entering stable mode
+    static bool wasStable = false;
+    if (!wasStable) {
+      Serial.println();
+      Serial.print("*** ENTERING STABLE MODE: ");
+      Serial.print(lastStableWasFlipped ? "FLIPPED" : "UPRIGHT");
+      Serial.println(" ***");
+      wasStable = true;
+    }
+  } else {
+    // Reset stable flag when leaving stable mode
+    static bool wasStable = false;
+    wasStable = false;
   }
 
 
@@ -546,11 +649,10 @@ void checkTilt() {
 
   Serial.print("\rTilt: ");
   Serial.print(tiltAngle, 1);
-  if (isUpsideDown) {
-    Serial.print("° (");
+  Serial.print("°");
+  if (lastStableWasFlipped) {
+    Serial.print(" [FLIP] → effective:");
     Serial.print(effectiveTiltAngle, 1);
-    Serial.print("° flipped)");
-  } else {
     Serial.print("°");
   }
   Serial.print(" | Z: ");
@@ -564,7 +666,7 @@ void checkTilt() {
     case STANDBY: Serial.print("STANDBY"); break;
     case COUNTDOWN: Serial.print("COUNTDOWN"); break;
     case PAUSED: Serial.print("PAUSED"); break;
-    case COMPLETED: Serial.print("COMPLETED"); break;
+    case COMPLETED: Serial.print("COMLPETED"); break;
   }
 
   // Check for state changes and render accordingly
@@ -672,7 +774,7 @@ void setup() {
   mx.clear();
 
   // Buzzer
-  ledcSetup(BUZZER_CHANNEL, 1000, BUZZER_RESOLUTION);
+  ledcSetup(BUZZER_CHANNEL, 400, BUZZER_RESOLUTION); // Conservative frequency that works reliably
   ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
   ledcWrite(BUZZER_CHANNEL, 0);
 
@@ -718,8 +820,9 @@ void loop() {
         if (!topFilled && fallingGrain >= GRAINS && !melodyPlayed) {
           melodyPlayed = true;
           currentState = COMPLETED;
+          Serial.println("Starting completion melody...");
           playCompletionMelody();
-          Serial.println("Countdown completed! Tilt again to restart.");
+          Serial.println("Melody finished. Countdown completed! Tilt again to restart.");
         }
       }
     updateSandLogic();
