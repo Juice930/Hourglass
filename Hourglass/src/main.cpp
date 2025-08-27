@@ -135,9 +135,8 @@ const uint8_t UNCHANGED_STEPS_THRESHOLD = 10; // Number of steps before auto-fli
 uint32_t lastStep = 0;
 const uint16_t STEP_MS = 500;     // animation speed (grid debug/unused timing)
 
-// Orientation: +1 = gravity to increasing row index (top->bottom)
-//              -1 = gravity upwards (bottom->top)
-int gravityDir = +1;
+// Orientation memory tracks the last stable orientation
+// This ensures consistent animation direction regardless of current tilt
 
 const uint8_t DIAMOND_GRAINS = 25; // For 8x8 diamond
 struct Grain { int y, x; };
@@ -295,16 +294,29 @@ void initGrainOrder() {
 
 void seedSandBottom() {
   clearGrid();
-  // Seed sand in a rotated diamond (touches corners)
+  // Seed sand in a diamond pattern
+  // Use orientation memory to determine which half to fill
+  
   uint16_t placed = 0;
   for (int y = 0; y < H && placed < SAND_COUNT; y++) {
     for (int x = 0; x < W && placed < SAND_COUNT; x++) {
-      // Rotated diamond: |x - 3.5| == |y - 7.5| for the diagonals, <= 3.5 for inside
-      if (abs((x - (W-1)/2.0) - (y - (H-1)/2.0)) <= (W-1)/2.0 && abs((x - (W-1)/2.0) + (y - (H-1)/2.0)) <= (W-1)/2.0) {
-        // For bottom half, only fill lower triangle
-        if ((gravityDir == +1 && y > x) || (gravityDir == -1 && y < x)) {
-          grid[y][x] = true;
-          placed++;
+      // Diamond pattern: |x - 3.5| + |y - center_y| <= 3.5
+      float centerY = (H-1) / 2.0;
+      float centerX = (W-1) / 2.0;
+      if (abs(x - centerX) + abs(y - centerY) <= (W-1)/2.0) {
+        // Fill based on orientation memory
+        if (lastStableWasFlipped) {
+          // Flipped: fill top half (rows 0-7) - this will be the "bottom" in flipped world
+          if (y < 8) {
+            grid[y][x] = true;
+            placed++;
+          }
+        } else {
+          // Upright: fill bottom half (rows 8-15) - this is the bottom in normal world
+          if (y >= 8) {
+            grid[y][x] = true;
+            placed++;
+          }
         }
       }
     }
@@ -360,69 +372,57 @@ void resetSystem() {
 static void drawSandState() {
   clearGrid();
   
-  // Check if hourglass is upside down using tilt angle (consistent with main logic)
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-  float magnitude = sqrt(a.acceleration.x*a.acceleration.x + a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z);
-  float tiltAngle = 0;
-  if (magnitude > 0.1) {
-    float cosAngle = a.acceleration.z / magnitude;
-    if (cosAngle >= 0) {
-      tiltAngle = acos(cosAngle) * 180.0 / PI;
-    } else {
-      tiltAngle = 180.0 - acos(-cosAngle) * 180.0 / PI;
-    }
-  }
-  bool isUpsideDown = (tiltAngle > 165.0);
+  // Use orientation memory instead of measuring tilt angle
+  // This ensures consistent animation direction based on last stable position
   
   if (topFilled) {
-    if (isUpsideDown) {
-      // Upside down: fill the bottom 8x8 matrix
-      for (uint8_t y = 8; y < 16; y++) {
-        for (uint8_t x = 0; x < W; x++) {
-          grid[y][x] = true;
-        }
-      }
-    } else {
-      // Right side up: fill the top 8x8 matrix
+    if (lastStableWasFlipped) {
+      // Flipped orientation: fill the top 8x8 matrix (rows 0-7)
       for (uint8_t y = 0; y < N; y++) {
         for (uint8_t x = 0; x < N; x++) {
           grid[y][x] = true;
         }
       }
+    } else {
+      // Upright orientation: fill the bottom 8x8 matrix (rows 8-15)
+      for (uint8_t y = 8; y < 16; y++) {
+        for (uint8_t x = 0; x < W; x++) {
+          grid[y][x] = true;
+        }
+      }
     }
   } else {
-    if (isUpsideDown) {
-      // Upside down: sand flows from bottom to top with 180° rotation
-      // Fill bottom except for grains that have fallen
+    if (lastStableWasFlipped) {
+      // Flipped orientation: sand flows from bottom matrix (rows 8-15) to top matrix (rows 0-7)
+      // Fill bottom matrix (source) except for grains that have fallen
       for (uint8_t i = fallingGrain; i < GRAINS; i++) {
         uint8_t idx = grainOrder[i];
         uint8_t y = (N-1-idx/N) + 8; // Mirror Y in bottom matrix
         uint8_t x = (N-1-idx%N);      // Mirror X for 180° rotation
         grid[y][x] = true;
       }
-      // Fill top with grains that have fallen (top down, X and Y not mirrored)
+      // Fill top matrix (destination) with grains that have fallen
       for (uint8_t i = 0; i < fallingGrain; i++) {
         uint8_t idx = grainOrder[i];
-        uint8_t y = idx / N;       // Keep Y as-is (no mirror)
-        uint8_t x = idx % N;       // Keep X as-is (no mirror)
+        uint8_t y = idx / N;       // Keep Y as-is in top matrix
+        uint8_t x = idx % N;       // Keep X as-is in top matrix
         grid[y][x] = true;
       }
     } else {
-      // Right side up: sand flows from top to bottom (original behavior)
-      // Fill top except for grains that have fallen
+      // Upright orientation: sand flows from top matrix (rows 0-7) to bottom matrix (rows 8-15)
+      // Fill top matrix (source) except for grains that have fallen
       for (uint8_t i = fallingGrain; i < GRAINS; i++) {
         uint8_t idx = grainOrder[i];
         uint8_t y = idx / N;
         uint8_t x = idx % N;
         grid[y][x] = true;
       }
-      // Fill bottom with grains that have fallen (bottom up, X mirrored)
+      // Fill bottom matrix (destination) with grains that have fallen (bottom up, X mirrored)
       for (uint8_t i = 0; i < fallingGrain; i++) {
         uint8_t idx = grainOrder[i];
-        uint8_t y = idx / N;
-        uint8_t x = idx % N;
-        grid[(N-1-y)+N][N-1-x] = true;
+        uint8_t y = (N-1-idx/N) + 8; // Mirror Y in bottom matrix
+        uint8_t x = (N-1-idx%N);      // Mirror X for 180° rotation
+        grid[y][x] = true;
       }
     }
   }
@@ -430,29 +430,17 @@ static void drawSandState() {
 
 // Overlay the single falling grain on the appropriate diagonal
 static void drawBottomFallingGrain() {
-  // Check if hourglass is upside down using tilt angle (consistent with main logic)
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-  float magnitude = sqrt(a.acceleration.x*a.acceleration.x + a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z);
-  float tiltAngle = 0;
-  if (magnitude > 0.1) {
-    float cosAngle = a.acceleration.z / magnitude;
-    if (cosAngle >= 0) {
-      tiltAngle = acos(cosAngle) * 180.0 / PI;
-    } else {
-      tiltAngle = 180.0 - acos(-cosAngle) * 180.0 / PI;
-    }
-  }
-  bool isUpsideDown = (tiltAngle > 165.0);
+  // Use orientation memory instead of measuring tilt angle
+  // This ensures consistent animation direction based on last stable position
   
   uint8_t y, x;
   
-  if (isUpsideDown) {
-    // Upside down: falling grain in top matrix, moving from bottom-right to top-left
+  if (lastStableWasFlipped) {
+    // Flipped orientation: falling grain in top matrix, moving from bottom-right to top-left
     y = 7 - bottomFallPhase;
     x = 7 - bottomFallPhase;
   } else {
-    // Right side up: falling grain in bottom matrix, moving from top-left to bottom-right
+    // Upright orientation: falling grain in bottom matrix, moving from top-left to bottom-right
     y = 8 + bottomFallPhase;
     x = bottomFallPhase;
   }
@@ -504,17 +492,31 @@ void updateSandLogic() {
     unchangedSteps = 0;
   }
   uint16_t sandInBottom = 0;
-  uint8_t yStart = (gravityDir == +1) ? 8 : 0;
-  uint8_t yEnd   = (gravityDir == +1) ? 16 : 8;
+  // Use orientation memory to determine which half contains the "bottom" (source of sand)
+  uint8_t yStart, yEnd;
+  if (lastStableWasFlipped) {
+    // Flipped: "bottom" (source) is the top matrix (rows 0-7), "top" (destination) is bottom matrix (rows 8-15)
+    yStart = 0;
+    yEnd = 8;
+  } else {
+    // Upright: "bottom" (source) is the bottom matrix (rows 8-15), "top" (destination) is top matrix (rows 0-7)
+    yStart = 8;
+    yEnd = 16;
+  }
   for (uint8_t y = yStart; y < yEnd; y++) {
     for (uint8_t x = 0; x < W; x++) {
       if (grid[y][x]) sandInBottom++;
     }
   }
   if (sandInBottom == SAND_COUNT && unchangedSteps >= UNCHANGED_STEPS_THRESHOLD) {
-    gravityDir = -gravityDir;
+    // Auto-flip: switch orientation and reseed sand
+    lastStableWasFlipped = !lastStableWasFlipped;
     seedSandBottom();
     unchangedSteps = 0;
+    Serial.println();
+    Serial.print("*** AUTO-FLIP: Orientation changed to ");
+    Serial.print(lastStableWasFlipped ? "FLIPPED" : "UPRIGHT");
+    Serial.println(" ***");
   }
 }
 
@@ -790,8 +792,8 @@ void setup() {
     Serial.println("MPU6050 initialized. Tilt to start countdown.");
   }
 
-  // Start with gravity "down" (+1). Seed initial sand.
-  gravityDir = +1;
+  // Start with upright orientation. Seed initial sand.
+  lastStableWasFlipped = false;
   initGrainOrder();
   seedSandBottom(); // Uncommented to initialize sand state
 }
