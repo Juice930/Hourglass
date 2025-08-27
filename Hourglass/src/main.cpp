@@ -116,6 +116,7 @@ Adafruit_MPU6050 mpu;
 // -------- System States --------
 enum SystemState {
   STANDBY,      // Waiting for tilt to start
+  CONFIG,       // Configuration menu for time selection
   COUNTDOWN,    // Sand is flowing
   PAUSED,       // Laid on side; animation paused
   COMPLETED     // Song finished, waiting for tilt to restart
@@ -159,9 +160,9 @@ uint16_t SAND_COUNT = 16; // Reduced for debugging
 // With current behavior: first bottom touch starts transfer (no increment),
 // then 64 increments occur. Each increment happens every 8 fall steps.
 // Total fall steps = 8 * (64 + 1) = 520.
-#define TARGET_DURATION_MS 5000
+uint32_t TARGET_DURATION_MS = 5000; // Made variable for configuration
 #define TOTAL_FALL_STEPS 520
-const uint16_t FALL_STEP_MS = (TARGET_DURATION_MS + (TOTAL_FALL_STEPS/2)) / TOTAL_FALL_STEPS; // rounded
+uint16_t FALL_STEP_MS = (TARGET_DURATION_MS + (TOTAL_FALL_STEPS/2)) / TOTAL_FALL_STEPS; // Made variable for configuration
 
 // Independent bottom falling-grain animation
 uint8_t bottomFallPhase = 0;       // 0..7 along the bottom diagonal
@@ -187,16 +188,47 @@ uint32_t lastShakeDetected = 0;
 // Track if user has been in stable position since completion (no longer needed)
 // bool hasBeenInStablePositionSinceCompletion = false;
 
+// -------- Configuration Menu --------
+struct TimeOption {
+  uint16_t value;
+  char unit;
+  const char* label;
+};
+
+const TimeOption TIME_OPTIONS[] = {
+  {30, 'S', "30S"},
+  {1, 'M', "1M"},
+  {2, 'M', "2M"},
+  {3, 'M', "3M"},
+  {5, 'M', "5M"},
+  {10, 'M', "10M"},
+  {15, 'M', "15M"},
+  {20, 'M', "20M"},
+  {25, 'M', "25M"},
+  {30, 'M', "30M"}
+};
+
+const uint8_t NUM_TIME_OPTIONS = sizeof(TIME_OPTIONS) / sizeof(TIME_OPTIONS[0]);
+uint8_t selectedTimeOption = 0;
 
 
 
+
+
+// ---------------------- Function Declarations ----------------------
+void showConfigMenu();
+void updateConfigSelection(float rollAngle, float pitchAngle);
+void confirmTimeSelection();
+void displayDigit(uint8_t digit, uint8_t matrix);
+void displayNumber(uint16_t number, uint8_t matrix);
+void displayLetter(uint8_t letterIndex, uint8_t matrix);
 
 // ---------------------- Helpers ----------------------
 
 void render() {
-  // Clear all modules
-  mx.clear();
-
+  // Don't clear the display - preserve the demo content
+  // Only update the sand animation areas without clearing everything
+  
   // Our logical (0,0) is the top-left of the combined 16x8.
   // Device 0 = top matrix, device 1 = bottom matrix.
   // For daisy-chained devices, we calculate the absolute column position
@@ -269,6 +301,7 @@ void printGridDebug() {
   Serial.print(" | State: ");
   switch(currentState) {
     case STANDBY: Serial.print("STANDBY"); break;
+    case CONFIG: Serial.print("CONFIG"); break;
     case COUNTDOWN: Serial.print("COUNTDOWN"); break;
     case PAUSED: Serial.print("PAUSED"); break;
     case COMPLETED: Serial.print("COMPLETED"); break;
@@ -401,6 +434,193 @@ void resetSystem() {
   Serial.println("System reset - countdown started!");
 }
 
+// -------- Configuration Menu Functions --------
+void showConfigMenu() {
+  // Don't clear the entire display - let the demo continue running
+  
+  // Top screen shows the number
+  const TimeOption& option = TIME_OPTIONS[selectedTimeOption];
+  Serial.println("=== CONFIGURATION MENU ===");
+  Serial.print("Selected: ");
+  Serial.print(option.value);
+  Serial.print(" ");
+  Serial.println(option.unit);
+  Serial.print("Option ");
+  Serial.print(selectedTimeOption + 1);
+  Serial.print(" of ");
+  Serial.println(NUM_TIME_OPTIONS);
+  Serial.println("========================");
+  
+  // Display the current digit on the top matrix
+  displayDigit(selectedTimeOption + 1, 0);
+}
+
+// Digit patterns for 8x8 matrices (0 = off, 1 = on)
+// Each pattern is stored as 8 rows of 8 bits
+static const uint8_t digitPatterns[10][8] = {
+  // 0
+  {0x00, 0x38, 0x44, 0x42, 0x22, 0x1C, 0x00, 0x00},
+  // 1
+  {0x00, 0x70, 0x20, 0x10, 0x08, 0x04, 0x00, 0x00},
+  // 2
+  {0x00, 0x30, 0x40, 0x3C, 0x02, 0x04, 0x08, 0x00},
+  // 3
+  {0x00, 0x10, 0x20, 0x48, 0x72, 0x14, 0x18, 0x00},
+  // 4
+  {0x00, 0x10, 0x08, 0x48, 0x30, 0x10, 0x08, 0x00},
+  // 5
+  {0x00, 0x10, 0x28, 0x4C, 0x11, 0x12, 0x0C, 0x00},
+  // 6
+  {0x00, 0x18, 0x24, 0x46, 0x09, 0x12, 0x1C, 0x00},
+  // 7
+  {0x00, 0x10, 0x20, 0x40, 0x78, 0x04, 0x00, 0x00},
+  // 8
+  {0x00, 0x30, 0x48, 0x4C, 0x32, 0x12, 0x0C, 0x00},
+  // 9
+  {0x00, 0x30, 0x48, 0x30, 0x10, 0x08, 0x04, 0x00}
+};
+
+// Letter patterns for 8x8 matrices
+static const uint8_t letterPatterns[2][8] = {
+  // S
+  {0x00, 0x30, 0x48, 0x10, 0x12, 0x0C, 0x00, 0x00},
+  // M
+  {0x00, 0x10, 0x18, 0x74, 0x22, 0x10, 0x08, 0x00}
+};
+
+void displayDigit(uint8_t digit, uint8_t matrix) {
+  if (digit < 0 || digit > 9) return; // Support digits 0-9
+  
+  const uint8_t* pattern = digitPatterns[digit]; // No need to convert to 0-based index
+  
+  // Clear only the specific matrix area
+  for (uint8_t y = 0; y < 8; y++) {
+    for (uint8_t x = 0; x < 8; x++) {
+      // For matrix 0: use cols 0-7, for matrix 1: use cols 8-15
+      uint8_t col = x + (matrix * 8);
+      mx.setPoint(y, col, false); // Clear this matrix area
+    }
+  }
+  
+  // Display the digit pattern on the specified matrix
+  for (uint8_t y = 0; y < 8; y++) {
+    for (uint8_t x = 0; x < 8; x++) {
+      if (pattern[y] & (0x80 >> x)) {
+        // For matrix 0: use cols 0-7, for matrix 1: use cols 8-15
+        uint8_t col = x + (matrix * 8);
+        mx.setPoint(y, col, true);
+      }
+    }
+  }
+}
+
+void displayNumber(uint16_t number, uint8_t matrix) {
+  if (number >= 0 && number <= 9) {
+    displayDigit(number, matrix);
+  }
+}
+
+void displayLetter(uint8_t letterIndex, uint8_t matrix) {
+  if (letterIndex >= 2) return; // Only support S (0) and M (1)
+  
+  const uint8_t* pattern = letterPatterns[letterIndex];
+  
+  // Clear only the specific matrix area
+  for (uint8_t y = 0; y < 8; y++) {
+    for (uint8_t x = 0; x < 8; x++) {
+      // For matrix 0: use cols 0-7, for matrix 1: use cols 8-15
+      uint8_t col = x + (matrix * 8);
+      mx.setPoint(y, col, false); // Clear this matrix area
+    }
+  }
+  
+  // Display the letter pattern on the specified matrix
+  for (uint8_t y = 0; y < 8; y++) {
+    for (uint8_t x = 0; x < 8; x++) {
+      if (pattern[y] & (0x80 >> x)) {
+        // For matrix 0: use cols 0-7, for matrix 1: use cols 8-15
+        uint8_t col = x + (matrix * 8);
+        mx.setPoint(y, col, true);
+      }
+    }
+  }
+}
+
+void updateConfigSelection(float rollAngle, float pitchAngle) {
+  // Roll axis: browse through time options
+  // Left roll (negative) = shorter time, Right roll (positive) = longer time
+  // Pitch axis: confirm selection (pitch up 30°+ = confirm)
+  
+  // Handle roll-based browsing
+  if (abs(rollAngle) >= 15.0) { // Dead zone of ±15° for roll
+    // Map roll angle to time option selection
+    // Left roll (-15° to -45°) maps to shorter times (0 to middle)
+    // Right roll (+15° to +45°) maps to longer times (middle to end)
+    float normalizedRoll;
+    uint8_t newSelection;
+    
+    if (rollAngle < 0) {
+      // Left roll: shorter times (first half of options)
+      normalizedRoll = (rollAngle + 45.0) / 30.0; // -45° to -15° maps to 0.0 to 1.0
+      newSelection = (uint8_t)(normalizedRoll * (NUM_TIME_OPTIONS / 2));
+    } else {
+      // Right roll: longer times (second half of options)
+      normalizedRoll = (rollAngle - 15.0) / 30.0; // +15° to +45° maps to 0.0 to 1.0
+      newSelection = (NUM_TIME_OPTIONS / 2) + (uint8_t)(normalizedRoll * (NUM_TIME_OPTIONS / 2));
+    }
+    
+    // Clamp selection to valid range
+    if (newSelection >= NUM_TIME_OPTIONS) {
+      newSelection = NUM_TIME_OPTIONS - 1;
+    }
+    
+    Serial.print("Roll: ");
+    Serial.print(rollAngle, 1);
+    Serial.print("° → Selection: ");
+    Serial.println(newSelection);
+    
+    if (newSelection != selectedTimeOption) {
+      selectedTimeOption = newSelection;
+      showConfigMenu();
+    }
+  }
+  
+  // Handle pitch-based confirmation
+  if (pitchAngle >= 30.0) {
+    // Confirm selection and start countdown
+    Serial.print("Confirming selection at pitch ");
+    Serial.print(pitchAngle, 1);
+    Serial.println("°");
+    confirmTimeSelection();
+  }
+}
+
+void confirmTimeSelection() {
+  const TimeOption& selected = TIME_OPTIONS[selectedTimeOption];
+  
+  // Calculate the target duration based on selection
+  if (selected.unit == 'S') {
+    TARGET_DURATION_MS = selected.value * 1000; // Convert seconds to milliseconds
+  } else {
+    TARGET_DURATION_MS = selected.value * 60000; // Convert minutes to milliseconds
+  }
+  
+  // Recalculate fall step timing
+  FALL_STEP_MS = (TARGET_DURATION_MS + (TOTAL_FALL_STEPS/2)) / TOTAL_FALL_STEPS;
+  
+  Serial.print("Time selected: ");
+  Serial.print(selected.value);
+  Serial.print(selected.unit);
+  Serial.print(" (");
+  Serial.print(TARGET_DURATION_MS);
+  Serial.println("ms)");
+  
+  // Exit config mode and start countdown
+  currentState = COUNTDOWN;
+  resetSystem();
+}
+
+// TODO: Add logGridState function here when needed
 
 
 // Encapsulated falling/transfer draw (does not advance counts)
@@ -512,6 +732,10 @@ void updateSandLogic() {
   if (currentState == PAUSED)
     return;
   
+  // Only run sand animation when in COUNTDOWN state
+  if (currentState != COUNTDOWN)
+    return;
+  
   // Draw sand state
   stepSand();
   // Overlay independent falling grain
@@ -566,14 +790,17 @@ void checkTilt() {
   float yAccel = a.acceleration.y;
   float zAccel = a.acceleration.z;
   float magnitude = sqrt(xAccel*xAccel + yAccel*yAccel + zAccel*zAccel);
+  
+  // Calculate roll and pitch angles from accelerometer data
+  // Roll: rotation around X-axis (left/right tilt like airplane banking)
+  // Pitch: rotation around Y-axis (forward/backward tilt like airplane nose up/down)
+  float rollAngle = atan2(yAccel, zAccel) * 180.0 / PI;
+  float pitchAngle = atan2(-xAccel, sqrt(yAccel*yAccel + zAccel*zAccel)) * 180.0 / PI;
+  
+  // Calculate tilt angle for backward compatibility
   float tiltAngle = 0;
   if (magnitude > 0.1) {
-    // Calculate tilt angle from vertical (0° = upright, 180° = upside down)
-    // Use the Z-axis as the reference for vertical orientation
     float cosAngle = zAccel / magnitude;
-    
-    // Always calculate the actual tilt angle from vertical (0° = upright, 90° = horizontal)
-    // The sign of Z-acceleration tells us which side we're tilted, but the angle is always positive
     tiltAngle = acos(abs(cosAngle)) * 180.0 / PI;
   }
 
@@ -599,16 +826,16 @@ void checkTilt() {
   bool isUpright = (effectiveTiltAngle < 20.0);
   
   // Debug: Show the actual values being used for zone detection
-  Serial.print(" | isUpright:"); Serial.print(isUpright ? "YES" : "NO");
-  Serial.print(" | effectiveTilt:"); Serial.print(effectiveTiltAngle, 1);
-  Serial.print(" | stableCalc:"); Serial.print(lastStableWasFlipped ? "FLIP<20" : "UPRT<20");
+  // Serial.print(" | isUpright:"); Serial.print(isUpright ? "YES" : "NO");
+  // Serial.print(" | effectiveTilt:"); Serial.print(effectiveTiltAngle, 1);
+  // Serial.print(" | stableCalc:"); Serial.print(lastStableWasFlipped ? "FLIP<20" : "UPRT<20");
   
   bool isSideways = (effectiveTiltAngle > 70.0 && effectiveTiltAngle < 120.0); // 70° to 120°: sideways (extended)
   
   // Debug: Show both raw and effective angles for troubleshooting
-  if (lastStableWasFlipped) {
-    Serial.print(" | Raw: "); Serial.print(tiltAngle, 1); Serial.print("° → Effective: "); Serial.print(effectiveTiltAngle, 1); Serial.print("° (FLIP)");
-  }
+  // if (lastStableWasFlipped) {
+  //   Serial.print(" | Raw: "); Serial.print(tiltAngle, 1); Serial.print("° → Effective: "); Serial.print(effectiveTiltAngle, 1); Serial.print("° (FLIP)");
+  // }
   
                              // Stability detection: both orientations use the same logic
      // - Upright orientation: effectiveTiltAngle < 20.0 is stable
@@ -662,31 +889,32 @@ void checkTilt() {
   }
   bool sidewaysStable = (now - sidewaysStateChangeMs >= 150); // Reduced from 200ms to 150ms for faster response
 
-  Serial.print("\rTilt: ");
-  Serial.print(tiltAngle, 1);
-  Serial.print("°");
-  if (lastStableWasFlipped) {
-    Serial.print(" [FLIP] → effective:");
-    Serial.print(effectiveTiltAngle, 1);
-    Serial.print("°");
-  }
-  Serial.print(" | Z: ");
-  Serial.print(zAccel, 2);
-  Serial.print(" | Zones: ");
-  Serial.print(isUpright ? "UPRIGHT" : (isSideways ? "SIDEWAYS" : "TILTED"));
-  Serial.print(" | Mem:");
-  Serial.print(lastStableWasFlipped ? "FLIP" : "UPRT");
-  Serial.print(" | State: ");
-  switch(currentState) {
-    case STANDBY: Serial.print("STANDBY"); break;
-    case COUNTDOWN: Serial.print("COUNTDOWN"); break;
-    case PAUSED: Serial.print("PAUSED"); break;
-    case COMPLETED: Serial.print("COMPLETED"); break;
-  }
-  Serial.print(" | Stable:");
-  Serial.print(isStable ? "YES" : "NO");
-  Serial.print(" | UpsideDown:");
-  Serial.print(isUpsideDown ? "YES" : "NO");
+  // Serial.print("\rTilt: ");
+  // Serial.print(tiltAngle, 1);
+  // Serial.print("°");
+  // if (lastStableWasFlipped) {
+  //   Serial.print(" [FLIP] → effective:");
+  //   Serial.print(effectiveTiltAngle, 1);
+  //   Serial.print("°");
+  // }
+  // Serial.print(" | Z: ");
+  // Serial.print(zAccel, 2);
+  // Serial.print(" | Zones: ");
+  // Serial.print(isUpright ? "UPRIGHT" : (isSideways ? "SIDEWAYS" : "TILTED"));
+  // Serial.print(" | Mem:");
+  // Serial.print(lastStableWasFlipped ? "FLIP" : "UPRT");
+  // Serial.print(" | State: ");
+  // switch(currentState) {
+  //   case STANDBY: Serial.print("STANDBY"); break;
+  //   case CONFIG: Serial.print("CONFIG"); break;
+  //   case COUNTDOWN: Serial.print("COUNTDOWN"); break;
+  //   case PAUSED: Serial.print("PAUSED"); break;
+  //   case COMPLETED: Serial.print("COMPLETED"); break;
+  // }
+  // Serial.print(" | Stable:");
+  // Serial.print(isStable ? "YES" : "NO");
+  // Serial.print(" | UpsideDown:");
+  // Serial.print(isUpsideDown ? "YES" : "NO");
   
   // Add shake detection debug (but don't call detectShake here to avoid double-calling)
   // Shake detection is handled in the state machine logic below
@@ -708,14 +936,26 @@ void checkTilt() {
       Serial.println(" | PAUSED");
       Serial.println("*** PAUSED STATE TRIGGERED FROM STANDBY ***");
     } else if (effectiveTiltAngle >= 20.0 && effectiveTiltAngle <= 70.0) {
-      // Start countdown from TILTED zone (20°-70° effective angle, works for both orientations)
-      Serial.println(" | TILT DETECTED - Starting countdown!");
-      resetSystem();
-      lastAnimTickMs = now;
+      // Enter configuration menu instead of starting countdown directly
+      Serial.println("*** ENTERING CONFIGURATION MENU ***");
+      currentState = CONFIG;
+      selectedTimeOption = 0;
+      showConfigMenu();
     } else if (isStable) {
       Serial.println(" | Stable position");
     } else {
       Serial.println(" | Other position");
+    }
+  } else if (currentState == CONFIG) {
+    // Handle configuration menu
+    if (detectShake(magnitude)) {
+      // Shake to cancel configuration
+      currentState = STANDBY;
+      Serial.println(" | CONFIG CANCELLED - Shake detected!");
+      Serial.println("*** CONFIG CANCELLED - Shake detected! ***");
+    } else {
+      // Update selection based on roll and pitch angles
+      updateConfigSelection(rollAngle, pitchAngle);
     }
   } else if (currentState == COUNTDOWN) {
     // Check for shake to cancel countdown
@@ -808,7 +1048,7 @@ void setup() {
   // MAX7219
   mx.begin();
   mx.control(MD_MAX72XX::INTENSITY, 6); // 0..15
-  mx.clear();
+  // Don't clear here - let the demo start immediately
 
   // Buzzer
   ledcSetup(BUZZER_CHANNEL, 400, BUZZER_RESOLUTION); // Conservative frequency that works reliably
@@ -838,6 +1078,16 @@ void setup() {
   
   initGrainOrder();
   seedSandBottom(); // Uncommented to initialize sand state
+  
+  // Start in configuration mode to select time
+  currentState = CONFIG;
+  selectedTimeOption = 0;
+  showConfigMenu();
+  Serial.println("Entering configuration mode. ROLL left/right to browse time options, PITCH up 30°+ to confirm.");
+  
+  // Clear display once at startup
+  mx.clear();
+  Serial.println("System initialized and ready.");
 }
 
 void loop() {
@@ -874,7 +1124,18 @@ void loop() {
 
   // Handle standby state
   if (currentState == STANDBY) {
-    mx.clear();
+    // Don't clear display - let demo continue running
     delay(100);
   }
+  
+  // Handle configuration state
+  if (currentState == CONFIG) {
+    // Configuration menu is handled in checkTilt() function
+    // Just keep the display active
+    delay(100);
+  }
+  
+
+  
+
 }
