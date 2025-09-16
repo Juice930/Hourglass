@@ -176,6 +176,7 @@ uint32_t lastAnimTickMs = 0;
 uint32_t totalFramesCounted = 0;
 bool frameCountingStarted = false;
 bool frameCountingCompleted = false;
+bool displayTurnedOffAfterCompletion = false;
 
 // Sideways hysteresis tracking
 bool lastIsSideways = false;
@@ -446,6 +447,8 @@ void resetSystem() {
 // -------- Configuration Menu Functions --------
 void showConfigMenu() {
   // Don't clear the entire display - let the demo continue running
+  // Ensure display is active (in case it was turned off after completion)
+  mx.control(MD_MAX72XX::SHUTDOWN, false);
   
   // Top screen shows the number
   const TimeOption& option = TIME_OPTIONS[selectedTimeOption];
@@ -460,25 +463,37 @@ void showConfigMenu() {
   Serial.println(NUM_TIME_OPTIONS);
   Serial.println("========================");
   
-  // Display the time value on the top matrix
+  // Decide which physical matrix shows number/unit based on orientation memory
+  uint8_t numberMatrix = lastStableWasFlipped ? 1 : 0; // when flipped, put number on physical bottom
+  uint8_t unitMatrix   = lastStableWasFlipped ? 0 : 1;
+
+  // Display the time value
   if (option.value < 10) {
-    // Single digit: just show the digit
-    displayDigit(option.value, 0);
+    displayDigit(option.value, numberMatrix);
   } else {
     // Multiple digits: show current digit based on global state
     uint8_t tensDigit = option.value / 10;
     uint8_t onesDigit = option.value % 10;
-    
-    // Display the current digit
-    displayDigit(digitIndex == 0 ? tensDigit : onesDigit, 0);
+    displayDigit(digitIndex == 0 ? tensDigit : onesDigit, numberMatrix);
   }
   
-  // Display the unit on the bottom matrix
+  // Display the unit
   if (option.unit == 'S') {
-    displayLetter(0, 1); // S
+    displayLetter(0, unitMatrix); // S
   } else if (option.unit == 'M') {
-    displayLetter(1, 1); // M
+    displayLetter(1, unitMatrix); // M
   }
+}
+
+static void blinkDisplayThreeTimesAndTurnOff() {
+  // Blink entire display 3 times, then leave it off
+  for (uint8_t i = 0; i < 3; i++) {
+    mx.control(MD_MAX72XX::SHUTDOWN, true);
+    delay(200);
+    mx.control(MD_MAX72XX::SHUTDOWN, false);
+    delay(200);
+  }
+  mx.control(MD_MAX72XX::SHUTDOWN, true); // turn off
 }
 
 // Digit patterns for 8x8 matrices (0 = off, 1 = on)
@@ -532,9 +547,11 @@ void displayDigit(uint8_t digit, uint8_t matrix) {
   for (uint8_t y = 0; y < 8; y++) {
     for (uint8_t x = 0; x < 8; x++) {
       if (pattern[y] & (0x80 >> x)) {
-        // For matrix 0: use cols 0-7, for matrix 1: use cols 8-15
-        uint8_t col = x + (matrix * 8);
-        mx.setPoint(y, col, true);
+        // Rotate content 180° when flipped so it's readable
+        uint8_t drawY = lastStableWasFlipped ? (uint8_t)(7 - y) : y;
+        uint8_t drawX = lastStableWasFlipped ? (uint8_t)(7 - x) : x;
+        uint8_t col = drawX + (matrix * 8);
+        mx.setPoint(drawY, col, true);
       }
     }
   }
@@ -564,9 +581,11 @@ void displayLetter(uint8_t letterIndex, uint8_t matrix) {
   for (uint8_t y = 0; y < 8; y++) {
     for (uint8_t x = 0; x < 8; x++) {
       if (pattern[y] & (0x80 >> x)) {
-        // For matrix 0: use cols 0-7, for matrix 1: use cols 8-15
-        uint8_t col = x + (matrix * 8);
-        mx.setPoint(y, col, true);
+        // Rotate content 180° when flipped so it's readable
+        uint8_t drawY = lastStableWasFlipped ? (uint8_t)(7 - y) : y;
+        uint8_t drawX = lastStableWasFlipped ? (uint8_t)(7 - x) : x;
+        uint8_t col = drawX + (matrix * 8);
+        mx.setPoint(drawY, col, true);
       }
     }
   }
@@ -578,27 +597,56 @@ void updateConfigSelection(float rollAngle, float pitchAngle) {
   // Pitch axis: confirm selection (pitch up 30°+ = confirm)
   
   // Handle roll-based browsing
-    float normalizedRoll;
-    uint8_t newSelection;
+    // Normalize orientation so browsing behaves the same upside down
+    float effectiveRoll = lastStableWasFlipped ? -rollAngle : rollAngle;
     
-    if (rollAngle < -25)
-        rollAngle = -25;
-    else if(rollAngle > 34.5)
-        rollAngle = 34.5;
+    // Normalize to [-180, 180]
+    while (effectiveRoll > 180.0f) effectiveRoll -= 360.0f;
+    while (effectiveRoll < -180.0f) effectiveRoll += 360.0f;
 
-    newSelection = (uint8_t) ((rollAngle + 25) / 10);
+    // Map specified angle bands to selection indices
+    int candidate = -1;
+    // Sel 0
+    if ((effectiveRoll >= -165.0f && effectiveRoll <= -155.0f) || (effectiveRoll >= -25.0f && effectiveRoll <= -15.0f)) {
+      candidate = 0;
+    }
+    // Sel 1
+    else if ((effectiveRoll >= -175.0f && effectiveRoll <= -165.0f) || (effectiveRoll >= -15.0f && effectiveRoll <= -5.0f)) {
+      candidate = 1;
+    }
+    // Sel 2 (near 180 wrap or near 0)
+    else if (fabsf(effectiveRoll) >= 175.0f || (effectiveRoll >= -5.0f && effectiveRoll <= 5.0f)) {
+      candidate = 2;
+    }
+    // Sel 3
+    else if ((effectiveRoll >= 165.0f && effectiveRoll <= 175.0f) || (effectiveRoll >= 5.0f && effectiveRoll <= 15.0f)) {
+      candidate = 3;
+    }
+    // Sel 4
+    else if ((effectiveRoll >= 155.0f && effectiveRoll <= 165.0f) || (effectiveRoll >= 15.0f && effectiveRoll <= 25.0f)) {
+      candidate = 4;
+    }
+    // Sel 5
+    else if ((effectiveRoll >= 145.0f && effectiveRoll <= 155.0f) || (effectiveRoll >= 25.0f && effectiveRoll <= 35.0f)) {
+      candidate = 5;
+    }
 
     Serial.print("Roll: ");
     Serial.print(rollAngle, 1);
-    Serial.print("° → Selection: ");
-    Serial.println(newSelection);
-    
-    if (newSelection != selectedTimeOption) {
-      selectedTimeOption = newSelection;
-      showConfigMenu();
-    }  
+    Serial.print(" | Effective: ");
+    Serial.print(effectiveRoll, 1);
+    if (candidate >= 0) {
+      Serial.print("° → Selection: ");
+      Serial.println(candidate);
+      if (selectedTimeOption != (uint8_t)candidate) {
+        selectedTimeOption = (uint8_t)candidate;
+        showConfigMenu();
+      }
+    } else {
+      Serial.println("° → (ignored)");
+    }
   // Handle pitch-based confirmation
-  if (pitchAngle >= 30.0) {
+  if (abs(pitchAngle) >= 30.0) {
     // Confirm selection and start countdown
     Serial.print("Confirming selection at pitch ");
     Serial.print(pitchAngle, 1);
@@ -1076,9 +1124,8 @@ void checkTilt() {
       lastAnimTickMs = now;
       Serial.println(" | PAUSED");
       Serial.println("*** PAUSED STATE TRIGGERED FROM COMPLETED ***");
-    } else if (isStable) {
-      // When reaching stable position from COMPLETED, transition to STANDBY
-      // This allows the user to restart countdown from STANDBY state
+    } else if (!isStable) { // any movement detected
+      // Leave COMPLETED on motion and go to STANDBY (ready state)
       currentState = STANDBY;
       topFilled = true;
       fallingGrain = 0;
@@ -1087,8 +1134,13 @@ void checkTilt() {
       melodyPlayed = false;
       clearGrid();
       seedSandBottom();
-      Serial.println(" | Transitioning to STANDBY - Ready to restart countdown!");
-      Serial.println("*** COMPLETED → STANDBY - Tilt to start new countdown ***");
+      // Wake display if it was turned off after completion
+      if (displayTurnedOffAfterCompletion) {
+        mx.control(MD_MAX72XX::SHUTDOWN, false);
+        displayTurnedOffAfterCompletion = false;
+      }
+      Serial.println(" | Motion detected → STANDBY - Ready to restart countdown!");
+      Serial.println("*** COMPLETED → STANDBY on motion ***");
     } else {
       Serial.println(" | Return to stable position to restart countdown");
     }
@@ -1180,6 +1232,8 @@ void loop() {
           Serial.println("Starting completion melody...");
           playCompletionMelody();
           Serial.println("Melody finished. Countdown completed! Tilt again to restart.");
+          blinkDisplayThreeTimesAndTurnOff();
+          displayTurnedOffAfterCompletion = true;
         }
       }
     updateSandLogic();
@@ -1204,7 +1258,8 @@ void loop() {
       if (option.value >= 10) {
         uint8_t tensDigit = option.value / 10;
         uint8_t onesDigit = option.value % 10;
-        displayDigit(digitIndex == 0 ? tensDigit : onesDigit, 0);
+        uint8_t numberMatrix = lastStableWasFlipped ? 1 : 0;
+        displayDigit(digitIndex == 0 ? tensDigit : onesDigit, numberMatrix);
       }
     }
     
