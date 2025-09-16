@@ -7,6 +7,11 @@
 //   - Adafruit Unified Sensor
 //   - Wire
 //
+// CONFIG MODE ACCESS: Only accessible when turning on or after shake cancellation
+// - At startup: Automatically enters CONFIG mode for time selection
+// - From any state: Shake to cancel and enter CONFIG mode
+// - From STANDBY: Tilt to start countdown directly (no CONFIG access)
+//
 // LEDC Configuration Notes:
 // - Using 6-bit resolution instead of 8-bit to avoid frequency conflicts
 // - Fixed frequency at 400Hz for maximum compatibility
@@ -79,20 +84,18 @@ static void buzzerTone(unsigned int freq, unsigned int durationMs) {
 }
 
 static void playCompletionMelody() {
-  // "Dancing in September" inspired jingle from Earth, Wind & Fire
-  // Melody captures the descending pattern: "Dan-cing in Sep-tem-ber"
-  // Notes: F5, E5, D5, C5, B4, A4, G4, F4
+  // A pleasant, gentle completion jingle
+  // Notes: C4, D4, E4, F4, G4, F4, E4, D4, C4 (ascending then descending)
   const unsigned int notes[] = { 
-    698, 659, 587, 523, 494, 440, 392, 349
+    262, 294, 330, 349, 392, 349, 330, 294, 262
   };
-  // Durations: Mimic the rhythm of "Dan-cing in Sep-tem-ber"
-  // "Dan" (long), "cing" (short), "in" (short), "Sep" (medium), "tem" (short), "ber" (long), "G4" (short), "F4" (long)
+  // Durations: Gentle, flowing rhythm
   const unsigned int lens[] = { 
-    200, 100, 100, 150, 100, 200, 100, 200
+    300, 200, 200, 200, 400, 200, 200, 200, 500
   };
   const size_t count = sizeof(notes)/sizeof(notes[0]);
   
-  Serial.print("Playing melody with ");
+  Serial.print("Playing completion melody with ");
   Serial.print(count);
   Serial.println(" notes");
   
@@ -101,7 +104,7 @@ static void playCompletionMelody() {
     if (i < sizeof(lens)/sizeof(lens[0])) { // Ensure we don't read beyond lens array
       buzzerTone(notes[i], lens[i]);
     } else {
-      buzzerTone(notes[i], 100); // Default duration if lens array is shorter
+      buzzerTone(notes[i], 200); // Default duration if lens array is shorter
     }
   }
   
@@ -157,18 +160,22 @@ const uint8_t NECK_X = 4;
 uint16_t SAND_COUNT = 16; // Reduced for debugging
 
 // ---------------------- Calibration ----------------------
-// With current behavior: first bottom touch starts transfer (no increment),
-// then 64 increments occur. Each increment happens every 8 fall steps.
-// Total fall steps = 8 * (64 + 1) = 520.
+// Actual measured frame count from the animation: 262 frames
+// This gives us accurate timing for the sand flow animation
 uint32_t TARGET_DURATION_MS = 5000; // Made variable for configuration
-#define TOTAL_FALL_STEPS 520
-uint16_t FALL_STEP_MS = (TARGET_DURATION_MS + (TOTAL_FALL_STEPS/2)) / TOTAL_FALL_STEPS; // Made variable for configuration
+#define TOTAL_FALL_STEPS 262
+uint16_t FALL_STEP_MS = 0; // Will be calculated based on selected time
 
 // Independent bottom falling-grain animation
 uint8_t bottomFallPhase = 0;       // 0..7 along the bottom diagonal
 
 // Global animation timer to support pause/resume without catch-up
 uint32_t lastAnimTickMs = 0;
+
+// Frame counter to measure actual total steps
+uint32_t totalFramesCounted = 0;
+bool frameCountingStarted = false;
+bool frameCountingCompleted = false;
 
 // Sideways hysteresis tracking
 bool lastIsSideways = false;
@@ -196,24 +203,20 @@ struct TimeOption {
 };
 
 const TimeOption TIME_OPTIONS[] = {
-  {30, 'S', "30S"},
-  {1, 'M', "1M"},
-  {2, 'M', "2M"},
-  {3, 'M', "3M"},
-  {5, 'M', "5M"},
-  {10, 'M', "10M"},
-  {15, 'M', "15M"},
-  {20, 'M', "20M"},
-  {25, 'M', "25M"},
-  {30, 'M', "30M"}
+    {30, 'S', "30S"},
+    {2, 'M', "2M"},
+    {1, 'M', "1M"},
+    {3, 'M', "3M"},
+    {5, 'M', "5M"},
+    {10, 'M', "10M"}
 };
 
 const uint8_t NUM_TIME_OPTIONS = sizeof(TIME_OPTIONS) / sizeof(TIME_OPTIONS[0]);
 uint8_t selectedTimeOption = 0;
 
-
-
-
+// Digit switching variables for multi-digit display
+uint8_t digitIndex = 0;
+uint32_t lastDigitChange = 0;
 
 // ---------------------- Function Declarations ----------------------
 void showConfigMenu();
@@ -430,6 +433,12 @@ void resetSystem() {
   unchangedSteps = 0;
   melodyPlayed = false;
   // hasBeenInStablePositionSinceCompletion = false; // Reset stable position flag (no longer needed)
+  
+  // Reset frame counter for new countdown
+  frameCountingStarted = false;
+  frameCountingCompleted = false;
+  totalFramesCounted = 0;
+  
   clearGrid();
   Serial.println("System reset - countdown started!");
 }
@@ -451,8 +460,25 @@ void showConfigMenu() {
   Serial.println(NUM_TIME_OPTIONS);
   Serial.println("========================");
   
-  // Display the current digit on the top matrix
-  displayDigit(selectedTimeOption + 1, 0);
+  // Display the time value on the top matrix
+  if (option.value < 10) {
+    // Single digit: just show the digit
+    displayDigit(option.value, 0);
+  } else {
+    // Multiple digits: show current digit based on global state
+    uint8_t tensDigit = option.value / 10;
+    uint8_t onesDigit = option.value % 10;
+    
+    // Display the current digit
+    displayDigit(digitIndex == 0 ? tensDigit : onesDigit, 0);
+  }
+  
+  // Display the unit on the bottom matrix
+  if (option.unit == 'S') {
+    displayLetter(0, 1); // S
+  } else if (option.unit == 'M') {
+    displayLetter(1, 1); // M
+  }
 }
 
 // Digit patterns for 8x8 matrices (0 = off, 1 = on)
@@ -552,28 +578,16 @@ void updateConfigSelection(float rollAngle, float pitchAngle) {
   // Pitch axis: confirm selection (pitch up 30°+ = confirm)
   
   // Handle roll-based browsing
-  if (abs(rollAngle) >= 15.0) { // Dead zone of ±15° for roll
-    // Map roll angle to time option selection
-    // Left roll (-15° to -45°) maps to shorter times (0 to middle)
-    // Right roll (+15° to +45°) maps to longer times (middle to end)
     float normalizedRoll;
     uint8_t newSelection;
     
-    if (rollAngle < 0) {
-      // Left roll: shorter times (first half of options)
-      normalizedRoll = (rollAngle + 45.0) / 30.0; // -45° to -15° maps to 0.0 to 1.0
-      newSelection = (uint8_t)(normalizedRoll * (NUM_TIME_OPTIONS / 2));
-    } else {
-      // Right roll: longer times (second half of options)
-      normalizedRoll = (rollAngle - 15.0) / 30.0; // +15° to +45° maps to 0.0 to 1.0
-      newSelection = (NUM_TIME_OPTIONS / 2) + (uint8_t)(normalizedRoll * (NUM_TIME_OPTIONS / 2));
-    }
-    
-    // Clamp selection to valid range
-    if (newSelection >= NUM_TIME_OPTIONS) {
-      newSelection = NUM_TIME_OPTIONS - 1;
-    }
-    
+    if (rollAngle < -25)
+        rollAngle = -25;
+    else if(rollAngle > 34.5)
+        rollAngle = 34.5;
+
+    newSelection = (uint8_t) ((rollAngle + 25) / 10);
+
     Serial.print("Roll: ");
     Serial.print(rollAngle, 1);
     Serial.print("° → Selection: ");
@@ -582,9 +596,7 @@ void updateConfigSelection(float rollAngle, float pitchAngle) {
     if (newSelection != selectedTimeOption) {
       selectedTimeOption = newSelection;
       showConfigMenu();
-    }
-  }
-  
+    }  
   // Handle pitch-based confirmation
   if (pitchAngle >= 30.0) {
     // Confirm selection and start countdown
@@ -605,15 +617,18 @@ void confirmTimeSelection() {
     TARGET_DURATION_MS = selected.value * 60000; // Convert minutes to milliseconds
   }
   
-  // Recalculate fall step timing
-  FALL_STEP_MS = (TARGET_DURATION_MS + (TOTAL_FALL_STEPS/2)) / TOTAL_FALL_STEPS;
+  // Recalculate fall step timing to match the selected duration
+  // Each fall step should take TARGET_DURATION_MS / TOTAL_FALL_STEPS milliseconds
+  FALL_STEP_MS = TARGET_DURATION_MS / TOTAL_FALL_STEPS;
   
   Serial.print("Time selected: ");
   Serial.print(selected.value);
   Serial.print(selected.unit);
   Serial.print(" (");
   Serial.print(TARGET_DURATION_MS);
-  Serial.println("ms)");
+  Serial.print("ms) → Step time: ");
+  Serial.print(FALL_STEP_MS);
+  Serial.println("ms");
   
   // Exit config mode and start countdown
   currentState = COUNTDOWN;
@@ -694,19 +709,74 @@ static void drawBottomFallingGrain() {
     // Flipped orientation: falling grain in top matrix, moving from bottom-right to top-left
     y = 7 - bottomFallPhase;
     x = 7 - bottomFallPhase;
+    
+    // Check if we've hit the sand surface (stop falling when we hit existing grains)
+    if (y < 8 && x < 8 && grid[y][x]) {
+      return; // Don't draw falling grain if it would overlap with existing sand
+    }
   } else {
     // Upright orientation: falling grain in bottom matrix, moving from top-left to bottom-right
     y = 8 + bottomFallPhase;
     x = bottomFallPhase;
+    
+    // Check if we've hit the sand surface (stop falling when we hit existing grains)
+    if (y < 16 && x < 8 && grid[y][x]) {
+      return; // Don't draw falling grain if it would overlap with existing sand
+    }
   }
   
-  grid[y][x] = true;
+  // Only draw the falling grain if it's within bounds and not overlapping
+  if (y >= 0 && y < H && x >= 0 && x < W) {
+    grid[y][x] = true;
+  }
 }
 
 // Advance the bottom falling grain animation; return true if it just touched ground
 static bool advanceBottomFallingGrain() {
-  bool touchedGround = (bottomFallPhase == 7);
-  bottomFallPhase = (bottomFallPhase + 1) % 8;
+  // Frame counting logic
+  if (!frameCountingCompleted) {
+    if (!frameCountingStarted) {
+      frameCountingStarted = true;
+      totalFramesCounted = 0;
+      Serial.println("*** FRAME COUNTING STARTED ***");
+    }
+    totalFramesCounted++;
+  }
+  
+  // Check if the next position would hit the sand surface
+  uint8_t nextY, nextX;
+  bool wouldHitSurface = false;
+  
+  if (lastStableWasFlipped) {
+    // Flipped orientation: check next position in top matrix
+    nextY = 7 - ((bottomFallPhase + 1) % 8);
+    nextX = 7 - ((bottomFallPhase + 1) % 8);
+    if (nextY < 8 && nextX < 8 && grid[nextY][nextX]) {
+      wouldHitSurface = true;
+    }
+  } else {
+    // Upright orientation: check next position in bottom matrix
+    nextY = 8 + ((bottomFallPhase + 1) % 8);
+    nextX = (bottomFallPhase + 1) % 8;
+    if (nextY < 16 && nextX < 8 && grid[nextY][nextX]) {
+      wouldHitSurface = true;
+    }
+  }
+  
+  // Check if current position is at the edge of the matrix
+  bool atEdge = (bottomFallPhase == 7);
+  
+  // Grain touches ground when it hits the surface OR reaches the edge
+  bool touchedGround = wouldHitSurface || atEdge;
+  
+  if (touchedGround) {
+    // Immediately reset to start the next grain falling
+    bottomFallPhase = 0;
+  } else {
+    // Continue with current grain
+    bottomFallPhase = (bottomFallPhase + 1) % 8;
+  }
+  
   return touchedGround;
 }
 
@@ -936,15 +1006,15 @@ void checkTilt() {
       Serial.println(" | PAUSED");
       Serial.println("*** PAUSED STATE TRIGGERED FROM STANDBY ***");
     } else if (effectiveTiltAngle >= 20.0 && effectiveTiltAngle <= 70.0) {
-      // Enter configuration menu instead of starting countdown directly
-      Serial.println("*** ENTERING CONFIGURATION MENU ***");
-      currentState = CONFIG;
-      selectedTimeOption = 0;
-      showConfigMenu();
+      // Start countdown directly when tilting in STANDBY state
+      // CONFIG mode is only accessible at startup or after shake cancellation
+      Serial.println("*** STARTING COUNTDOWN ***");
+      currentState = COUNTDOWN;
+      resetSystem();
     } else if (isStable) {
-      Serial.println(" | Stable position");
+      //Serial.println(" | Stable position");
     } else {
-      Serial.println(" | Other position");
+      //Serial.println(" | Other position");
     }
   } else if (currentState == CONFIG) {
     // Handle configuration menu
@@ -960,16 +1030,11 @@ void checkTilt() {
   } else if (currentState == COUNTDOWN) {
     // Check for shake to cancel countdown
     if (detectShake(magnitude)) {
-      currentState = STANDBY;
-      topFilled = true;
-      fallingGrain = 0;
-      bottomFallPhase = 0;
-      unchangedSteps = 0;
-      melodyPlayed = false;
-      clearGrid();
-      seedSandBottom();
-      Serial.println(" | COUNTDOWN CANCELLED - Shake detected!");
-      Serial.println("*** COUNTDOWN CANCELLED - Shake detected! ***");
+      currentState = CONFIG;
+      selectedTimeOption = 0;
+      showConfigMenu();
+      Serial.println(" | COUNTDOWN CANCELLED - Entering CONFIG mode!");
+      Serial.println("*** COUNTDOWN CANCELLED - Entering CONFIG mode! ***");
     }
     // Allow pausing from COUNTDOWN state when laid sideways
     else if (isSideways && sidewaysStable) {
@@ -978,21 +1043,16 @@ void checkTilt() {
       Serial.println(" | PAUSED");
       Serial.println("*** PAUSED STATE TRIGGERED FROM COUNTDOWN ***");
     } else {
-      Serial.println(); // Just add newline for COUNTDOWN state
+      //Serial.println(); // Just add newline for COUNTDOWN state
     }
   } else if (currentState == PAUSED) {
     // Check for shake to cancel from paused state
     if (detectShake(magnitude)) {
-      currentState = STANDBY;
-      topFilled = true;
-      fallingGrain = 0;
-      bottomFallPhase = 0;
-      unchangedSteps = 0;
-      melodyPlayed = false;
-      clearGrid();
-      seedSandBottom();
-      Serial.println(" | CANCELLED FROM PAUSED - Shake detected!");
-      Serial.println("*** CANCELLED FROM PAUSED - Shake detected! ***");
+      currentState = CONFIG;
+      selectedTimeOption = 0;
+      showConfigMenu();
+      Serial.println(" | CANCELLED FROM PAUSED - Entering CONFIG mode!");
+      Serial.println("*** CANCELLED FROM PAUSED - Entering CONFIG mode! ***");
     } else if (!isSideways && sidewaysStable) {
       currentState = COUNTDOWN;
       lastAnimTickMs = now;
@@ -1005,16 +1065,11 @@ void checkTilt() {
   } else if (currentState == COMPLETED) {
     // Check for shake to reset to standby
     if (detectShake(magnitude)) {
-      currentState = STANDBY;
-      topFilled = true;
-      fallingGrain = 0;
-      bottomFallPhase = 0;
-      unchangedSteps = 0;
-      melodyPlayed = false;
-      clearGrid();
-      seedSandBottom();
-      Serial.println(" | RESET - Shake detected!");
-      Serial.println("*** RESET - Shake detected! ***");
+      currentState = CONFIG;
+      selectedTimeOption = 0;
+      showConfigMenu();
+      Serial.println(" | RESET - Entering CONFIG mode!");
+      Serial.println("*** RESET - Entering CONFIG mode! ***");
     }
     else if (isSideways && sidewaysStable) {
       currentState = PAUSED;
@@ -1112,6 +1167,14 @@ void loop() {
       if (touched) {
         performSandStep();
         if (!topFilled && fallingGrain >= GRAINS && !melodyPlayed) {
+          // Frame counting completed
+          if (!frameCountingCompleted) {
+            frameCountingCompleted = true;
+            Serial.print("*** FRAME COUNTING COMPLETED: ");
+            Serial.print(totalFramesCounted);
+            Serial.println(" total frames ***");
+          }
+          
           melodyPlayed = true;
           currentState = COMPLETED;
           Serial.println("Starting completion melody...");
@@ -1130,8 +1193,21 @@ void loop() {
   
   // Handle configuration state
   if (currentState == CONFIG) {
-    // Configuration menu is handled in checkTilt() function
-    // Just keep the display active
+    // Handle digit switching for multi-digit display
+    uint32_t now = millis();
+    if (now - lastDigitChange >= 1000) { // Change every second
+      lastDigitChange = now;
+      digitIndex = (digitIndex + 1) % 2; // Alternate between 0 and 1
+      
+      // Update the display with the new digit
+      const TimeOption& option = TIME_OPTIONS[selectedTimeOption];
+      if (option.value >= 10) {
+        uint8_t tensDigit = option.value / 10;
+        uint8_t onesDigit = option.value % 10;
+        displayDigit(digitIndex == 0 ? tensDigit : onesDigit, 0);
+      }
+    }
+    
     delay(100);
   }
   
