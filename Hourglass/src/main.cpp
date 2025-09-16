@@ -56,20 +56,12 @@ static void buzzerTone(unsigned int freq, unsigned int durationMs) {
     durationMs = 100;
   }
   
-  // Map frequency to duty cycle to create different tone qualities
-  // Higher frequencies get higher duty cycles for brighter sound
-  // Increased duty cycles for louder volume
-  uint32_t duty;
-  if (freq >= 600) {
-    duty = 56; // High duty for high frequencies (F5, E5, D5) - increased from 48
-  } else if (freq >= 500) {
-    duty = 48; // Medium-high duty for medium frequencies (C5, B4) - increased from 40
-  } else if (freq >= 400) {
-    duty = 40; // Medium duty for lower frequencies (A4, G4) - increased from 32
-  } else {
-    duty = 32; // Lower duty for lowest frequencies (F4) - increased from 24
-  }
-  
+  // Set PWM frequency per note so pitch actually changes
+  ledcSetup(BUZZER_CHANNEL, freq, BUZZER_RESOLUTION);
+
+  // Use 50% duty for maximum acoustic output on passive piezo
+  uint32_t duty = (1U << BUZZER_RESOLUTION) / 2; // 50%
+
   // Debug: Print what we're doing
   Serial.print("Playing tone: freq=");
   Serial.print(freq);
@@ -81,17 +73,23 @@ static void buzzerTone(unsigned int freq, unsigned int durationMs) {
   
   ledcWrite(BUZZER_CHANNEL, duty);
   delay(durationMs);
+  // Brief gap to articulate notes and avoid DC bias
+  ledcWrite(BUZZER_CHANNEL, 0);
+  delay(10);
 }
 
 static void playCompletionMelody() {
-  // A pleasant, gentle completion jingle
-  // Notes: C4, D4, E4, F4, G4, F4, E4, D4, C4 (ascending then descending)
-  const unsigned int notes[] = { 
-    262, 294, 330, 349, 392, 349, 330, 294, 262
+  // Second measure jingle at ~88 BPM
+  // Notes: D5 E5 D5 B4 D5 B4 A4 G4 A4 B4 G4 E4
+  // Lengths: 8 sixteenths, then eighth, sixteenth, eighth, eighth
+  const unsigned int notes[] = {
+    587, 659, 587, 494, 587, 494, 440, 392,
+    440, 494, 392
   };
-  // Durations: Gentle, flowing rhythm
-  const unsigned int lens[] = { 
-    300, 200, 200, 200, 400, 200, 200, 200, 500
+  const unsigned int lens[] = {
+    // 88 BPM → quarter ≈ 682 ms, eighth ≈ 341 ms, sixteenth ≈ 170 ms
+    170, 170, 170, 170, 170, 170, 170, 170,
+    341, 170, 682
   };
   const size_t count = sizeof(notes)/sizeof(notes[0]);
   
@@ -177,6 +175,9 @@ uint32_t totalFramesCounted = 0;
 bool frameCountingStarted = false;
 bool frameCountingCompleted = false;
 bool displayTurnedOffAfterCompletion = false;
+// CONFIG idle shutdown tracking
+uint32_t lastConfigInteractionMs = 0;
+bool displayTurnedOffForIdle = false;
 
 // Sideways hysteresis tracking
 bool lastIsSideways = false;
@@ -263,43 +264,6 @@ bool topFilled = true; // If true, top is filled, grains are falling
 
 // Encapsulated debug print
 void printGridDebug() {
-  // Grid debug commented out
-  /*
-  // Serial debug for grid and sand count commented out
-  // uint16_t sandInBottom = 0;
-  // uint8_t yStart = (gravityDir == +1) ? 8 : 0;
-  // uint8_t yEnd   = (gravityDir == +1) ? 16 : 8;
-  // for (uint8_t y = yStart; y < yEnd; y++) {
-  //   for (uint8_t x = 0; x < W; x++) {
-  //     if (grid[y][x]) sandInBottom++;
-  //   }
-  // }
-  // Serial.print("Sand in bottom/top: ");
-  // Serial.println(sandInBottom);
-  // Serial.println("Grid:");
-  // for (uint8_t y = 0; y < H; y++) {
-  //   for (uint8_t x = 0; x < W; x++) {
-  //     Serial.print(grid[y][x] ? "#" : ".");
-  //   }
-  //   Serial.println();
-  // }
-  // Print detected tilt instead
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-  float xAccel = a.acceleration.x;
-  float yAccel = a.acceleration.y;
-  float zAccel = a.acceleration.z;
-  float magnitude = sqrt(xAccel*xAccel + yAccel*yAccel + zAccel*zAccel);
-  float tiltAngle = 0;
-  if (magnitude > 0.1) {
-    tiltAngle = acos(abs(zAccel) / magnitude) * 180.0 / PI;
-  }
-  Serial.print("Tilt: ");
-  Serial.print(tiltAngle, 1);
-  Serial.print("° | Z: ");
-  Serial.print(zAccel, 2);
-  Serial.println(" m/s²");
-  */
   
   // Print system state info (overwrite same line)
   Serial.print(" | State: ");
@@ -449,6 +413,7 @@ void showConfigMenu() {
   // Don't clear the entire display - let the demo continue running
   // Ensure display is active (in case it was turned off after completion)
   mx.control(MD_MAX72XX::SHUTDOWN, false);
+  displayTurnedOffForIdle = false;
   
   // Top screen shows the number
   const TimeOption& option = TIME_OPTIONS[selectedTimeOption];
@@ -640,6 +605,7 @@ void updateConfigSelection(float rollAngle, float pitchAngle) {
       Serial.println(candidate);
       if (selectedTimeOption != (uint8_t)candidate) {
         selectedTimeOption = (uint8_t)candidate;
+        lastConfigInteractionMs = millis();
         showConfigMenu();
       }
     } else {
@@ -943,21 +909,9 @@ void checkTilt() {
   // - Flipped orientation: 0°-20° is upright (stable) - same angle ranges
   bool isUpright = (effectiveTiltAngle < 20.0);
   
-  // Debug: Show the actual values being used for zone detection
-  // Serial.print(" | isUpright:"); Serial.print(isUpright ? "YES" : "NO");
-  // Serial.print(" | effectiveTilt:"); Serial.print(effectiveTiltAngle, 1);
-  // Serial.print(" | stableCalc:"); Serial.print(lastStableWasFlipped ? "FLIP<20" : "UPRT<20");
-  
   bool isSideways = (effectiveTiltAngle > 70.0 && effectiveTiltAngle < 120.0); // 70° to 120°: sideways (extended)
   
   // Debug: Show both raw and effective angles for troubleshooting
-  // if (lastStableWasFlipped) {
-  //   Serial.print(" | Raw: "); Serial.print(tiltAngle, 1); Serial.print("° → Effective: "); Serial.print(effectiveTiltAngle, 1); Serial.print("° (FLIP)");
-  // }
-  
-                             // Stability detection: both orientations use the same logic
-     // - Upright orientation: effectiveTiltAngle < 20.0 is stable
-     // - Flipped orientation: effectiveTiltAngle < 20.0 is stable (same angle ranges)
      bool isStable = (effectiveTiltAngle < 20.0) || isUpsideDown;
   
 
@@ -1075,11 +1029,46 @@ void checkTilt() {
       // Update selection based on roll and pitch angles
       updateConfigSelection(rollAngle, pitchAngle);
     }
+    // Periodically print time since last interaction
+    {
+      static uint32_t lastIdlePrintMs = 0;
+      if (now - lastIdlePrintMs >= 1000) {
+        lastIdlePrintMs = now;
+        uint32_t sinceMs = now - lastConfigInteractionMs;
+        Serial.print("CONFIG idle: ");
+        Serial.print(sinceMs / 1000);
+        Serial.println("s since last interaction");
+      }
+    }
+    // Movement counts as interaction: wake if off, otherwise just reset idle timer
+    {
+      static float lastRollForIdle = 0.0f;
+      static float lastPitchForIdle = 0.0f;
+      float delta = fabsf(rollAngle - lastRollForIdle) + fabsf(pitchAngle - lastPitchForIdle);
+      lastRollForIdle = rollAngle;
+      lastPitchForIdle = pitchAngle;
+      if (delta > 2.0f) { // small movement threshold ~2 degrees
+        if (displayTurnedOffForIdle) {
+          mx.control(MD_MAX72XX::SHUTDOWN, false);
+          displayTurnedOffForIdle = false;
+          showConfigMenu();
+          Serial.println("*** CONFIG WAKE - Movement detected, display on ***");
+        }
+        lastConfigInteractionMs = now; // restart idle timer on movement
+      }
+    }
+    // Idle shutdown after 30 seconds without changes
+    if (!displayTurnedOffForIdle && (now - lastConfigInteractionMs >= 30000)) {
+      mx.control(MD_MAX72XX::SHUTDOWN, true);
+      displayTurnedOffForIdle = true;
+      Serial.println("*** CONFIG IDLE TIMEOUT - Display turned off ***");
+    }
   } else if (currentState == COUNTDOWN) {
     // Check for shake to cancel countdown
     if (detectShake(magnitude)) {
       currentState = CONFIG;
       selectedTimeOption = 0;
+      lastConfigInteractionMs = now;
       showConfigMenu();
       Serial.println(" | COUNTDOWN CANCELLED - Entering CONFIG mode!");
       Serial.println("*** COUNTDOWN CANCELLED - Entering CONFIG mode! ***");
@@ -1098,6 +1087,7 @@ void checkTilt() {
     if (detectShake(magnitude)) {
       currentState = CONFIG;
       selectedTimeOption = 0;
+      lastConfigInteractionMs = now;
       showConfigMenu();
       Serial.println(" | CANCELLED FROM PAUSED - Entering CONFIG mode!");
       Serial.println("*** CANCELLED FROM PAUSED - Entering CONFIG mode! ***");
@@ -1115,6 +1105,7 @@ void checkTilt() {
     if (detectShake(magnitude)) {
       currentState = CONFIG;
       selectedTimeOption = 0;
+      lastConfigInteractionMs = now;
       showConfigMenu();
       Serial.println(" | RESET - Entering CONFIG mode!");
       Serial.println("*** RESET - Entering CONFIG mode! ***");
@@ -1142,7 +1133,6 @@ void checkTilt() {
       Serial.println(" | Motion detected → STANDBY - Ready to restart countdown!");
       Serial.println("*** COMPLETED → STANDBY on motion ***");
     } else {
-      Serial.println(" | Return to stable position to restart countdown");
     }
   }
 }
@@ -1158,7 +1148,7 @@ void setup() {
   // Don't clear here - let the demo start immediately
 
   // Buzzer
-  ledcSetup(BUZZER_CHANNEL, 400, BUZZER_RESOLUTION); // Conservative frequency that works reliably
+  ledcSetup(BUZZER_CHANNEL, 400, BUZZER_RESOLUTION); // Initial frequency; will be updated per note
   ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
   ledcWrite(BUZZER_CHANNEL, 0);
 
@@ -1190,6 +1180,8 @@ void setup() {
   currentState = CONFIG;
   selectedTimeOption = 0;
   showConfigMenu();
+  lastConfigInteractionMs = millis();
+  displayTurnedOffForIdle = false;
   Serial.println("Entering configuration mode. ROLL left/right to browse time options, PITCH up 30°+ to confirm.");
   
   // Clear display once at startup
